@@ -4,3 +4,4 @@ firebase-admin
 anthropic
 groq
 streamlit-mic-recorder
+streamlit-option-menu
