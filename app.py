@@ -7,8 +7,10 @@
 # =============================================================
 import streamlit as st
 import pandas as pd
+import plotly.graph_objects as go
 from datetime import date
 from auth import check_login, show_user_bar
+from theme import apply_theme, render_metric_card, get_theme_colors, style_plotly
 from backend_functions import (
     load_categories, add_category_if_new, save_transaction,
     load_transactions, delete_transaction, update_transaction,
@@ -16,6 +18,7 @@ from backend_functions import (
 )
 
 st.set_page_config(page_title="บันทึกรายรับ-รายจ่าย", page_icon="💰", layout="wide")
+apply_theme()
 
 # เช็ค Login ก่อนเสมอ — ถ้ายังไม่ได้ login จะแสดงฟอร์ม login แล้วหยุดทำงานตรงนี้เลย
 if not check_login():
@@ -289,90 +292,118 @@ elif selected_menu == "ประวัติรายการ":
         st.info("ยังไม่มีรายการบันทึกไว้เลยครับ")
     else:
         df = pd.DataFrame(transactions)
-        df['type_label'] = df['type'].map({'income': '🟢 รายรับ', 'expense': '🔴 รายจ่าย'})
-        # 🆕 เพิ่ม 'image': '📷 รูปภาพ' เข้า mapping ที่มา (source) เพราะตอนนี้มีช่องทางบันทึกใหม่แล้ว
-        df['source_label'] = df['source'].map({'manual': '✍️ พิมพ์', 'voice': '🎤 พูด', 'image': '📷 รูปภาพ'})
+        df['date_parsed'] = pd.to_datetime(df['date'])
 
-        display_df = df[['date', 'type_label', 'amount', 'category', 'description', 'source_label']].rename(columns={
-            'date': 'วันที่', 'type_label': 'ประเภท', 'amount': 'จำนวนเงิน',
-            'category': 'หมวดหมู่', 'description': 'รายละเอียด', 'source_label': 'ที่มา'
-        })
+        # 🆕 ตัวกรองเดือน — เลือกดูเฉพาะเดือนที่ต้องการ
+        THAI_MONTHS = {
+            1: "มกราคม", 2: "กุมภาพันธ์", 3: "มีนาคม", 4: "เมษายน", 5: "พฤษภาคม", 6: "มิถุนายน",
+            7: "กรกฎาคม", 8: "สิงหาคม", 9: "กันยายน", 10: "ตุลาคม", 11: "พฤศจิกายน", 12: "ธันวาคม"
+        }
+        df['month_key'] = df['date_parsed'].dt.strftime('%Y-%m')
+        df['month_label'] = df.apply(lambda r: f"{THAI_MONTHS[r['date_parsed'].month]} {r['date_parsed'].year}", axis=1)
 
-        st.caption("💡 คลิกที่แถวในตารางเพื่อเลือกรายการที่ต้องการแก้ไขหรือลบ (คลิกหัวคอลัมน์เพื่อเรียงลำดับได้ด้วย)")
-        event = st.dataframe(
-            display_df, use_container_width=True, hide_index=True,
-            on_select="rerun", selection_mode="single-row", key="history_table"
+        month_lookup = df[['month_key', 'month_label']].drop_duplicates().sort_values('month_key', ascending=False)
+        month_choice = st.selectbox(
+            "📅 เลือกเดือนที่ต้องการดู", ["ทั้งหมด"] + month_lookup['month_label'].tolist(),
+            key="history_month_filter"
         )
 
-        selected_rows = event.selection.rows if event and event.selection else []
+        if month_choice != "ทั้งหมด":
+            _selected_month_key = month_lookup[month_lookup['month_label'] == month_choice]['month_key'].iloc[0]
+            _mask = df['month_key'] == _selected_month_key
+        else:
+            _mask = pd.Series([True] * len(df), index=df.index)
 
-        # 🔧 แก้บั๊ก: เดิมถ้าเคยเลือกแถวไว้ (เช่น แถวสุดท้าย) แล้วลบรายการไปจนรายการเหลือน้อยลง
-        # selection state ของตาราง (เก็บไว้ใน session_state ตาม key="history_table") จะยังค้าง
-        # index เดิมอยู่ข้ามการรีเฟรชหน้า พอ index เดิมเกินขอบเขตของรายการที่เหลืออยู่จริง จะเกิด
-        # IndexError ทันที ตอนนี้เช็คขอบเขตก่อนเข้าถึงเสมอ ถ้าเกินขอบเขตให้ถือว่าไม่มีอะไรถูกเลือก
-        if selected_rows and selected_rows[0] < len(transactions):
-            selected_idx = selected_rows[0]
-            selected_transaction = transactions[selected_idx]
+        # 🔧 สำคัญ: เก็บ index ดั้งเดิมของ transactions list ไว้คู่กับ df ที่กรองแล้ว เพื่อให้
+        # "แถวที่ถูกเลือกในตาราง" ยังชี้กลับไปหารายการที่ถูกต้องใน transactions ได้เสมอ แม้จะกรอง
+        # เหลือแค่บางเดือนแล้วก็ตาม
+        filtered_df = df[_mask].reset_index(drop=True)
+        filtered_transactions = [transactions[i] for i in df[_mask].index.tolist()]
 
-            st.divider()
-            st.markdown("##### ✏️ แก้ไข/ลบรายการที่เลือก")
+        if filtered_df.empty:
+            st.info("ไม่มีรายการในเดือนที่เลือกเลยครับ")
+        else:
+            filtered_df['type_label'] = filtered_df['type'].map({'income': '🟢 รายรับ', 'expense': '🔴 รายจ่าย'})
+            filtered_df['source_label'] = filtered_df['source'].map({'manual': '✍️ พิมพ์', 'voice': '🎤 พูด', 'image': '📷 รูปภาพ'})
 
-            with st.form("edit_transaction_form"):
-                ec1, ec2 = st.columns(2)
-                with ec1:
-                    edit_type = st.radio(
-                        "ประเภท", ["รายจ่าย", "รายรับ"], horizontal=True,
-                        index=0 if selected_transaction['type'] == 'expense' else 1,
-                        key="edit_type"
-                    )
-                    edit_date = st.date_input(
-                        "วันที่", value=pd.to_datetime(selected_transaction['date']).date(), key="edit_date"
-                    )
-                    edit_amount = st.number_input(
-                        "จำนวนเงิน (บาท)", min_value=0.0, step=10.0,
-                        value=float(selected_transaction['amount']), format="%.2f", key="edit_amount"
-                    )
-                with ec2:
-                    edit_category_list = expense_categories if edit_type == "รายจ่าย" else income_categories
-                    _current_cat = selected_transaction['category']
-                    _edit_options = edit_category_list + ([_current_cat] if _current_cat not in edit_category_list else [])
-                    edit_category = st.selectbox(
-                        "หมวดหมู่", _edit_options,
-                        index=_edit_options.index(_current_cat) if _current_cat in _edit_options else 0,
-                        key="edit_category"
-                    )
-                    edit_description = st.text_area(
-                        "รายละเอียด", value=selected_transaction['description'], key="edit_description"
-                    )
+            display_df = filtered_df[['date', 'type_label', 'amount', 'category', 'description', 'source_label']].rename(columns={
+                'date': 'วันที่', 'type_label': 'ประเภท', 'amount': 'จำนวนเงิน',
+                'category': 'หมวดหมู่', 'description': 'รายละเอียด', 'source_label': 'ที่มา'
+            })
 
-                edit_col1, edit_col2 = st.columns(2)
-                with edit_col1:
-                    save_edit = st.form_submit_button("💾 บันทึกการแก้ไข", type="primary", use_container_width=True)
-                with edit_col2:
-                    delete_edit = st.form_submit_button("🗑️ ลบรายการนี้", use_container_width=True)
+            st.caption("💡 คลิกที่แถวในตารางเพื่อเลือกรายการที่ต้องการแก้ไขหรือลบ (คลิกหัวคอลัมน์เพื่อเรียงลำดับได้ด้วย)")
+            # 🔧 ใช้ key แบบ dynamic ตาม month_choice — พอเปลี่ยนตัวกรองเดือน widget selection จะ
+            # รีเซ็ตใหม่หมดทุกครั้งโดยอัตโนมัติ (Streamlit ถือว่า key ต่างกัน = widget คนละตัว) กัน
+            # ปัญหา selection ค้าง index เกินขอบเขตข้ามการเปลี่ยนตัวกรอง (บั๊กเดียวกับที่เคยแก้ไปแล้ว
+            # ตอนลบรายการ แต่คราวนี้ป้องกันกรณี "เปลี่ยนตัวกรอง" เพิ่มเข้ามาด้วย)
+            table_key = f"history_table_{month_choice}"
+            event = st.dataframe(
+                display_df, use_container_width=True, hide_index=True,
+                on_select="rerun", selection_mode="single-row", key=table_key
+            )
 
-            if save_edit:
-                if edit_amount <= 0:
-                    st.warning("กรุณาระบุจำนวนเงินมากกว่า 0 ครับ")
-                else:
-                    edit_type_code = "expense" if edit_type == "รายจ่าย" else "income"
-                    add_category_if_new(edit_category, edit_type_code, current_user)
-                    update_transaction(
-                        selected_transaction['id'], edit_date, edit_type_code,
-                        edit_amount, edit_category, edit_description
-                    )
-                    # 🆕 ล้าง selection ของตารางทิ้งก่อน rerun เสมอ กันปัญหา index ค้างข้ามรีเฟรช
-                    st.session_state.pop("history_table", None)
-                    st.success("✅ แก้ไขสำเร็จ!")
+            selected_rows = event.selection.rows if event and event.selection else []
+
+            if selected_rows and selected_rows[0] < len(filtered_transactions):
+                selected_idx = selected_rows[0]
+                selected_transaction = filtered_transactions[selected_idx]
+
+                st.divider()
+                st.markdown("##### ✏️ แก้ไข/ลบรายการที่เลือก")
+
+                with st.form("edit_transaction_form"):
+                    ec1, ec2 = st.columns(2)
+                    with ec1:
+                        edit_type = st.radio(
+                            "ประเภท", ["รายจ่าย", "รายรับ"], horizontal=True,
+                            index=0 if selected_transaction['type'] == 'expense' else 1,
+                            key="edit_type"
+                        )
+                        edit_date = st.date_input(
+                            "วันที่", value=pd.to_datetime(selected_transaction['date']).date(), key="edit_date"
+                        )
+                        edit_amount = st.number_input(
+                            "จำนวนเงิน (บาท)", min_value=0.0, step=10.0,
+                            value=float(selected_transaction['amount']), format="%.2f", key="edit_amount"
+                        )
+                    with ec2:
+                        edit_category_list = expense_categories if edit_type == "รายจ่าย" else income_categories
+                        _current_cat = selected_transaction['category']
+                        _edit_options = edit_category_list + ([_current_cat] if _current_cat not in edit_category_list else [])
+                        edit_category = st.selectbox(
+                            "หมวดหมู่", _edit_options,
+                            index=_edit_options.index(_current_cat) if _current_cat in _edit_options else 0,
+                            key="edit_category"
+                        )
+                        edit_description = st.text_area(
+                            "รายละเอียด", value=selected_transaction['description'], key="edit_description"
+                        )
+
+                    edit_col1, edit_col2 = st.columns(2)
+                    with edit_col1:
+                        save_edit = st.form_submit_button("💾 บันทึกการแก้ไข", type="primary", use_container_width=True)
+                    with edit_col2:
+                        delete_edit = st.form_submit_button("🗑️ ลบรายการนี้", use_container_width=True)
+
+                if save_edit:
+                    if edit_amount <= 0:
+                        st.warning("กรุณาระบุจำนวนเงินมากกว่า 0 ครับ")
+                    else:
+                        edit_type_code = "expense" if edit_type == "รายจ่าย" else "income"
+                        add_category_if_new(edit_category, edit_type_code, current_user)
+                        update_transaction(
+                            selected_transaction['id'], edit_date, edit_type_code,
+                            edit_amount, edit_category, edit_description
+                        )
+                        st.session_state.pop(table_key, None)
+                        st.success("✅ แก้ไขสำเร็จ!")
+                        st.rerun()
+
+                if delete_edit:
+                    delete_transaction(selected_transaction['id'])
+                    st.session_state.pop(table_key, None)
+                    st.success("ลบสำเร็จ")
                     st.rerun()
-
-            if delete_edit:
-                delete_transaction(selected_transaction['id'])
-                # 🆕 ล้าง selection ของตารางทิ้งก่อน rerun เสมอ (จุดสำคัญที่สุด เพราะการลบทำให้
-                # จำนวนรายการลดลงจริง เสี่ยง index เกินขอบเขตมากที่สุดในบรรดาการกระทำทั้งหมด)
-                st.session_state.pop("history_table", None)
-                st.success("ลบสำเร็จ")
-                st.rerun()
 
 
 # =============================================================
@@ -386,19 +417,85 @@ elif selected_menu == "สรุปภาพรวม":
         st.info("ยังไม่มีข้อมูลให้สรุปครับ")
     else:
         df = pd.DataFrame(transactions)
-        total_income = df[df['type'] == 'income']['amount'].sum()
-        total_expense = df[df['type'] == 'expense']['amount'].sum()
-        net = total_income - total_expense
+        df['date_parsed'] = pd.to_datetime(df['date'])
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("รายรับรวม", f"{total_income:,.0f} ฿")
-        c2.metric("รายจ่ายรวม", f"{total_expense:,.0f} ฿")
-        c3.metric("คงเหลือสุทธิ", f"{net:,.0f} ฿", delta=f"{net:,.0f}")
+        # 🆕 ตัวกรองช่วงเวลา — 3 เดือน, 6 เดือน, 1 ปี, ทั้งหมด, หรือกำหนดเอง
+        st.markdown("##### 🗓️ เลือกช่วงเวลา")
+        range_choice = st.radio(
+            "ช่วงเวลา", ["3 เดือนล่าสุด", "6 เดือนล่าสุด", "1 ปีล่าสุด", "ทั้งหมด", "กำหนดเอง"],
+            horizontal=True, key="summary_range_choice", label_visibility="collapsed"
+        )
+
+        today_ts = pd.Timestamp(date.today())
+        if range_choice == "3 เดือนล่าสุด":
+            filtered_df = df[df['date_parsed'] >= today_ts - pd.DateOffset(months=3)]
+        elif range_choice == "6 เดือนล่าสุด":
+            filtered_df = df[df['date_parsed'] >= today_ts - pd.DateOffset(months=6)]
+        elif range_choice == "1 ปีล่าสุด":
+            filtered_df = df[df['date_parsed'] >= today_ts - pd.DateOffset(years=1)]
+        elif range_choice == "ทั้งหมด":
+            filtered_df = df
+        else:  # กำหนดเอง
+            dc1, dc2 = st.columns(2)
+            with dc1:
+                custom_start = st.date_input(
+                    "จากวันที่", value=df['date_parsed'].min().date(), key="summary_custom_start"
+                )
+            with dc2:
+                custom_end = st.date_input("ถึงวันที่", value=date.today(), key="summary_custom_end")
+            filtered_df = df[
+                (df['date_parsed'] >= pd.Timestamp(custom_start)) &
+                (df['date_parsed'] <= pd.Timestamp(custom_end))
+            ]
 
         st.divider()
-        st.markdown("##### 📊 รายจ่ายแยกตามหมวดหมู่")
-        expense_by_cat = df[df['type'] == 'expense'].groupby('category')['amount'].sum().sort_values(ascending=False)
-        if not expense_by_cat.empty:
-            st.bar_chart(expense_by_cat)
+
+        if filtered_df.empty:
+            st.info("ไม่มีรายการในช่วงเวลาที่เลือกเลยครับ")
         else:
-            st.caption("ยังไม่มีรายการรายจ่ายเลย")
+            total_income = filtered_df[filtered_df['type'] == 'income']['amount'].sum()
+            total_expense = filtered_df[filtered_df['type'] == 'expense']['amount'].sum()
+            net = total_income - total_expense
+
+            # 🆕 เปลี่ยนจาก st.metric() ธรรมดา มาเป็นการ์ดสไตล์เดียวกับ stock-scanner
+            c1, c2, c3 = st.columns(3)
+            render_metric_card(c1, "รายรับรวม", f"{total_income:,.0f} ฿", icon="🟢")
+            render_metric_card(c2, "รายจ่ายรวม", f"{total_expense:,.0f} ฿", icon="🔴")
+            render_metric_card(
+                c3, "คงเหลือสุทธิ", f"{net:,.0f} ฿", icon="💰",
+                delta="เกินดุล" if net >= 0 else "ขาดดุล", delta_positive=(net >= 0)
+            )
+
+            st.divider()
+            st.markdown("##### 📊 รายจ่ายแยกตามหมวดหมู่")
+
+            expense_by_cat = filtered_df[filtered_df['type'] == 'expense'].groupby('category')['amount'].sum().sort_values(ascending=False)
+
+            if expense_by_cat.empty:
+                st.caption("ยังไม่มีรายการรายจ่ายในช่วงเวลานี้เลย")
+            else:
+                # 🆕 แบ่งครึ่งหน้าจอ — กราฟแท่งด้านซ้าย + กราฟ Donut ด้านขวา (ใช้ข้อมูลเดียวกัน
+                # คนละมุมมอง: แท่งช่วยเทียบขนาดตรงๆ ส่วน Donut เห็นสัดส่วนโดยรวมชัดกว่า)
+                theme_colors = get_theme_colors()
+                chart_col1, chart_col2 = st.columns(2)
+
+                with chart_col1:
+                    fig_bar = go.Figure(go.Bar(
+                        x=expense_by_cat.values, y=expense_by_cat.index, orientation='h',
+                        marker_color=theme_colors['chart_colors'][:len(expense_by_cat)]
+                    ))
+                    fig_bar.update_layout(
+                        title="แยกตามหมวดหมู่ (แท่ง)", height=420,
+                        margin=dict(l=10, r=10, t=40, b=10), yaxis=dict(autorange="reversed")
+                    )
+                    st.plotly_chart(style_plotly(fig_bar), use_container_width=True)
+
+                with chart_col2:
+                    fig_donut = go.Figure(go.Pie(
+                        labels=expense_by_cat.index, values=expense_by_cat.values, hole=0.45,
+                        marker=dict(colors=theme_colors['chart_colors'])
+                    ))
+                    fig_donut.update_layout(
+                        title="สัดส่วนรายจ่าย", height=420, margin=dict(l=10, r=10, t=40, b=10)
+                    )
+                    st.plotly_chart(style_plotly(fig_donut), use_container_width=True)
