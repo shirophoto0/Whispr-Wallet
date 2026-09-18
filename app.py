@@ -9,7 +9,7 @@ from datetime import date
 from auth import check_login, show_user_bar
 from backend_functions import (
     load_categories, add_category_if_new, save_transaction,
-    load_transactions, delete_transaction, transcribe_audio, categorize_with_ai,
+    load_transactions, delete_transaction, update_transaction, transcribe_audio, categorize_with_ai,
 )
 
 st.set_page_config(page_title="บันทึกรายรับ-รายจ่าย", page_icon="💰", layout="wide")
@@ -150,6 +150,10 @@ with tab_record:
 
 # =============================================================
 # แท็บ 2: ประวัติรายการ
+# 🆕 ปรับปรุง: เปลี่ยนจากใช้ Dropdown เลือกรายการ (จะยาวเฟื้อยเมื่อข้อมูลเยอะขึ้น) มาเป็น
+# "คลิกเลือกแถวในตารางโดยตรง" แทน (ฟีเจอร์ของ st.dataframe ตั้งแต่ Streamlit 1.35.0) — คลิกหัว
+# คอลัมน์เพื่อเรียงลำดับได้ในตัวด้วย ช่วยหาแถวที่ต้องการง่ายขึ้นเมื่อมีรายการเยอะๆ พอเลือกแถวแล้ว
+# จะเปิดฟอร์มแก้ไข/ลบแยกต่างหากด้านล่าง (ไม่ใช่แก้ inline ในตาราง กันหมวดหมู่ผิดประเภทหลุดเข้าไป)
 # =============================================================
 with tab_history:
     transactions = load_transactions(current_user)
@@ -161,22 +165,79 @@ with tab_history:
         df['type_label'] = df['type'].map({'income': '🟢 รายรับ', 'expense': '🔴 รายจ่าย'})
         df['source_label'] = df['source'].map({'manual': '✍️ พิมพ์', 'voice': '🎤 พูด'})
 
-        st.dataframe(
-            df[['date', 'type_label', 'amount', 'category', 'description', 'source_label']].rename(columns={
-                'date': 'วันที่', 'type_label': 'ประเภท', 'amount': 'จำนวนเงิน',
-                'category': 'หมวดหมู่', 'description': 'รายละเอียด', 'source_label': 'ที่มา'
-            }),
-            use_container_width=True, hide_index=True
+        display_df = df[['date', 'type_label', 'amount', 'category', 'description', 'source_label']].rename(columns={
+            'date': 'วันที่', 'type_label': 'ประเภท', 'amount': 'จำนวนเงิน',
+            'category': 'หมวดหมู่', 'description': 'รายละเอียด', 'source_label': 'ที่มา'
+        })
+
+        st.caption("💡 คลิกที่แถวในตารางเพื่อเลือกรายการที่ต้องการแก้ไขหรือลบ (คลิกหัวคอลัมน์เพื่อเรียงลำดับได้ด้วย)")
+        event = st.dataframe(
+            display_df, use_container_width=True, hide_index=True,
+            on_select="rerun", selection_mode="single-row", key="history_table"
         )
 
-        st.divider()
-        st.markdown("##### 🗑️ ลบรายการ")
-        del_options = {f"{t['date']} | {t['category']} | {t['amount']:,.0f} บาท | {t['description'][:30]}": t['id'] for t in transactions}
-        to_delete = st.selectbox("เลือกรายการที่ต้องการลบ", list(del_options.keys()))
-        if st.button("🗑️ ลบรายการนี้"):
-            delete_transaction(del_options[to_delete])
-            st.success("ลบสำเร็จ")
-            st.rerun()
+        selected_rows = event.selection.rows if event and event.selection else []
+
+        if selected_rows:
+            # ⚠️ สำคัญ: ใช้ index เดียวกับ df/transactions ตรงๆ (ไม่ได้ sort/filter df ก่อนแสดงผล
+            # เลย ทำให้ index ในตารางที่เห็นตรงกับ index ใน transactions list เป๊ะ)
+            selected_idx = selected_rows[0]
+            selected_transaction = transactions[selected_idx]
+
+            st.divider()
+            st.markdown("##### ✏️ แก้ไข/ลบรายการที่เลือก")
+
+            with st.form("edit_transaction_form"):
+                ec1, ec2 = st.columns(2)
+                with ec1:
+                    edit_type = st.radio(
+                        "ประเภท", ["รายจ่าย", "รายรับ"], horizontal=True,
+                        index=0 if selected_transaction['type'] == 'expense' else 1,
+                        key="edit_type"
+                    )
+                    edit_date = st.date_input(
+                        "วันที่", value=pd.to_datetime(selected_transaction['date']).date(), key="edit_date"
+                    )
+                    edit_amount = st.number_input(
+                        "จำนวนเงิน (บาท)", min_value=0.0, step=10.0,
+                        value=float(selected_transaction['amount']), format="%.2f", key="edit_amount"
+                    )
+                with ec2:
+                    edit_category_list = expense_categories if edit_type == "รายจ่าย" else income_categories
+                    _current_cat = selected_transaction['category']
+                    _edit_options = edit_category_list + ([_current_cat] if _current_cat not in edit_category_list else [])
+                    edit_category = st.selectbox(
+                        "หมวดหมู่", _edit_options,
+                        index=_edit_options.index(_current_cat) if _current_cat in _edit_options else 0,
+                        key="edit_category"
+                    )
+                    edit_description = st.text_area(
+                        "รายละเอียด", value=selected_transaction['description'], key="edit_description"
+                    )
+
+                edit_col1, edit_col2 = st.columns(2)
+                with edit_col1:
+                    save_edit = st.form_submit_button("💾 บันทึกการแก้ไข", type="primary", use_container_width=True)
+                with edit_col2:
+                    delete_edit = st.form_submit_button("🗑️ ลบรายการนี้", use_container_width=True)
+
+            if save_edit:
+                if edit_amount <= 0:
+                    st.warning("กรุณาระบุจำนวนเงินมากกว่า 0 ครับ")
+                else:
+                    edit_type_code = "expense" if edit_type == "รายจ่าย" else "income"
+                    add_category_if_new(edit_category, edit_type_code, current_user)
+                    update_transaction(
+                        selected_transaction['id'], edit_date, edit_type_code,
+                        edit_amount, edit_category, edit_description
+                    )
+                    st.success("✅ แก้ไขสำเร็จ!")
+                    st.rerun()
+
+            if delete_edit:
+                delete_transaction(selected_transaction['id'])
+                st.success("ลบสำเร็จ")
+                st.rerun()
 
 # =============================================================
 # แท็บ 3: สรุปภาพรวม
