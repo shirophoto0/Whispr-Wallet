@@ -9,25 +9,31 @@ def check_login():
     """
     เช็คว่า login แล้วหรือยัง ถ้ายัง แสดงฟอร์ม login แล้วคืนค่า False (ให้ App.py หยุดทำงานต่อ)
     ถ้า login แล้ว คืนค่า True ให้ทำงานต่อได้ตามปกติ
+    🔧 ปรับปรุง: เปลี่ยนจากพิมพ์ชื่อผู้ใช้เอง เป็น "เลือกจาก Dropdown" แทน (ดึงรายชื่อมาจาก
+    Streamlit Secrets โดยตรง) ใช้งานง่ายขึ้น ไม่ต้องพิมพ์/จำชื่อผู้ใช้ให้ถูกเป๊ะ
     """
     if st.session_state.get('logged_in'):
         return True
 
     st.title("🔐 เข้าสู่ระบบ")
+
+    users = st.secrets.get("users", {})
+    if not users:
+        st.error("ยังไม่ได้ตั้งค่ารายชื่อผู้ใช้ใน Streamlit Secrets เลยครับ (ดูคำแนะนำท้ายไฟล์ auth.py)")
+        return False
+
     with st.form("login_form"):
-        username = st.text_input("ชื่อผู้ใช้")
+        username = st.selectbox("เลือกผู้ใช้", list(users.keys()))
         password = st.text_input("รหัสผ่าน", type="password")
         submitted = st.form_submit_button("เข้าสู่ระบบ", type="primary", use_container_width=True)
 
     if submitted:
-        # อ่านรายชื่อผู้ใช้ที่ตั้งไว้ใน Streamlit Secrets (ดูรูปแบบตั้งค่าท้ายไฟล์)
-        users = st.secrets.get("users", {})
-        if username in users and str(users[username]) == password:
+        if str(users[username]) == password:
             st.session_state['logged_in'] = True
             st.session_state['username'] = username
             st.rerun()
         else:
-            st.error("ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้องครับ")
+            st.error("รหัสผ่านไม่ถูกต้องครับ")
 
     return False
 
