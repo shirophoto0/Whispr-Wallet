@@ -248,7 +248,10 @@ if selected_menu == "บันทึกรายการ":
                 st.cache_data.clear()
                 st.rerun()
 
-    tab_income, tab_expense = st.tabs(["🟢 รายรับ", "🔴 รายจ่าย"])
+    # 🔧 ปรับปรุง: สลับให้แท็บ "รายจ่าย" เป็นแท็บซ้ายสุด (Streamlit เปิดแท็บซ้ายสุดเป็นค่าเริ่มต้น
+    # เสมอ) เพราะใช้บันทึกรายจ่ายบ่อยกว่ารายรับมากในชีวิตประจำวัน — สลับแค่ตำแหน่งการแสดงผล ตัวแปร
+    # tab_expense/tab_income ยังอ้างอิงความหมายเดิมทุกจุด ไม่กระทบโค้ดด้านล่างเลย
+    tab_expense, tab_income = st.tabs(["🔴 รายจ่าย", "🟢 รายรับ"])
 
     with tab_income:
         income_method = st.radio(
