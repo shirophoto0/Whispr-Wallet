@@ -226,6 +226,28 @@ def render_image_entry():
 if selected_menu == "บันทึกรายการ":
     st.title("📝 บันทึกรายการ")
 
+    # 🆕 เพิ่มหมวดหมู่เองได้โดยตรง — ไม่ต้องพึ่ง AI สร้างให้อัตโนมัติเท่านั้น เผื่ออยากเพิ่มหมวดหมู่
+    # ที่รู้อยู่แล้วว่าจะใช้บ่อยไว้ล่วงหน้าเลย (เช่น หมวดหมู่ที่เพิ่งเปลี่ยนแปลงมาจากค่าเริ่มต้น แต่
+    # บัญชีนี้เคยสร้างหมวดหมู่ไปแล้วก่อนหน้า ค่าเริ่มต้นใหม่จะไม่ถูกเพิ่มให้อัตโนมัติอีก)
+    with st.expander("➕ เพิ่มหมวดหมู่เอง"):
+        with st.form("add_category_form", clear_on_submit=True):
+            ac1, ac2 = st.columns([1, 2])
+            with ac1:
+                new_cat_type = st.radio("ประเภท", ["รายรับ", "รายจ่าย"], horizontal=True, key="new_cat_type")
+            with ac2:
+                new_cat_name = st.text_input("ชื่อหมวดหมู่ใหม่", placeholder="เช่น ปันผลหุ้น", key="new_cat_name")
+            add_cat_submitted = st.form_submit_button("➕ เพิ่มหมวดหมู่นี้", type="primary")
+
+        if add_cat_submitted:
+            if not new_cat_name.strip():
+                st.warning("กรุณาพิมพ์ชื่อหมวดหมู่ก่อนครับ")
+            else:
+                _type_code = "income" if new_cat_type == "รายรับ" else "expense"
+                add_category_if_new(new_cat_name.strip(), _type_code, current_user)
+                st.success(f"✅ เพิ่มหมวดหมู่ '{new_cat_name.strip()}' ({new_cat_type}) สำเร็จแล้ว")
+                st.cache_data.clear()
+                st.rerun()
+
     tab_income, tab_expense = st.tabs(["🟢 รายรับ", "🔴 รายจ่าย"])
 
     with tab_income:
