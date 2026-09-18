@@ -125,6 +125,19 @@ def delete_transaction(doc_id):
     st.cache_data.clear()
 
 
+def update_transaction(doc_id, trans_date, trans_type, amount, category, description):
+    """แก้ไขรายการที่มีอยู่แล้วใน Firestore ตาม document ID (ไม่สร้างรายการใหม่ อัปเดตของเดิม)"""
+    db = get_firestore_client()
+    db.collection('transactions').document(doc_id).update({
+        'date': str(trans_date),
+        'type': trans_type,
+        'amount': float(amount),
+        'category': category,
+        'description': description,
+    })
+    st.cache_data.clear()
+
+
 # =============================================================
 # ส่วนที่ 4: แปลงเสียงเป็นข้อความ (Groq Whisper API)
 # =============================================================
