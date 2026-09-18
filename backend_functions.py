@@ -216,11 +216,3 @@ def categorize_with_ai(user_text, expense_categories, income_categories):
 
     parsed = json.loads(json_match.group(0))
     return parsed
-
-        st.divider()
-        st.markdown("##### 📊 รายจ่ายแยกตามหมวดหมู่")
-        expense_by_cat = df[df['type'] == 'expense'].groupby('category')['amount'].sum().sort_values(ascending=False)
-        if not expense_by_cat.empty:
-            st.bar_chart(expense_by_cat)
-        else:
-            st.caption("ยังไม่มีรายการรายจ่ายเลย")
