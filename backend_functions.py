@@ -20,6 +20,12 @@ DEFAULT_INCOME_CATEGORIES = [
     "ปันผลสหกรณ์", "รายได้เสริมอื่นๆ", "อื่นๆ"
 ]
 
+# 🆕 กลุ่มหมวดหมู่ (Category Group) — ใช้แยก "รายการหักจากเงินเดือน" (ประกันสังคม, PVD, ภาษี,
+# สหกรณ์ — ที่ถูกหักออกอัตโนมัติ ไม่ใช่การตัดสินใจใช้จ่ายเอง) ออกจาก "ค่าใช้จ่ายทั่วไป" (การใช้จ่าย
+# จริงในชีวิตประจำวัน) เพื่อให้กรองดูแยกกันได้ในหน้าสรุปภาพรวม — มีความหมายเฉพาะฝั่งรายจ่ายเท่านั้น
+CATEGORY_GROUP_GENERAL = "ค่าใช้จ่ายทั่วไป"
+CATEGORY_GROUP_PAYROLL = "รายการหักจากเงินเดือน"
+
 
 # =============================================================
 # ส่วนที่ 1: เชื่อมต่อ Firebase Firestore
@@ -46,6 +52,8 @@ def load_categories(category_type, user_id):
     """
     โหลดรายชื่อหมวดหมู่ทั้งหมดของผู้ใช้คนนี้จาก Firestore (แยกตามประเภท 'income' หรือ 'expense')
     ถ้ายังไม่เคยมีเลย จะสร้างหมวดหมู่เริ่มต้นให้อัตโนมัติในครั้งแรก
+    คืนค่าเป็น list ของชื่อ string ล้วนๆ (เหมือนเดิม ใช้กับ Dropdown ปกติทั่วไป — ไม่รวมข้อมูลกลุ่ม
+    ด้วย ถ้าต้องการกลุ่มด้วยให้ใช้ load_categories_with_group() แทน)
     """
     db = get_firestore_client()
     categories_ref = (
@@ -56,21 +64,65 @@ def load_categories(category_type, user_id):
     docs = list(categories_ref.stream())
 
     if not docs:
-        # ยังไม่เคยมีหมวดหมู่เลย สร้างชุดเริ่มต้นให้อัตโนมัติ
+        # ยังไม่เคยมีหมวดหมู่เลย สร้างชุดเริ่มต้นให้อัตโนมัติ (ทุกหมวดหมู่เริ่มต้นเข้ากลุ่ม
+        # "ค่าใช้จ่ายทั่วไป" เพราะยังไม่มีอันไหนมาจากสลิปเงินเดือนเลย)
         default_list = DEFAULT_EXPENSE_CATEGORIES if category_type == 'expense' else DEFAULT_INCOME_CATEGORIES
         for name in default_list:
-            db.collection('categories').add({'name': name, 'type': category_type, 'user_id': user_id})
+            db.collection('categories').add({
+                'name': name, 'type': category_type, 'user_id': user_id,
+                'group': CATEGORY_GROUP_GENERAL,
+            })
         return default_list
 
     return sorted([doc.to_dict()['name'] for doc in docs])
 
 
-def add_category_if_new(name, category_type, user_id):
-    """เพิ่มหมวดหมู่ใหม่ลง Firestore ถ้าผู้ใช้คนนี้ยังไม่มีหมวดหมู่นี้อยู่แล้ว (กันหมวดหมู่ซ้ำ)"""
+def load_categories_with_group(category_type, user_id):
+    """
+    🆕 โหลดรายชื่อหมวดหมู่พร้อมข้อมูลกลุ่ม (ใช้กับหน้าจัดการกลุ่มหมวดหมู่ + ตัวกรองกลุ่มในหน้าสรุป
+    ภาพรวม) คืนค่าเป็น list ของ dict {doc_id, name, group}
+    หมวดหมู่เก่าที่สร้างไว้ก่อนมีฟีเจอร์นี้ (ยังไม่มี field 'group' เลย) จะถือว่าอยู่กลุ่ม
+    "ค่าใช้จ่ายทั่วไป" เป็นค่าเริ่มต้นไปก่อน จนกว่าจะไปจัดกลุ่มใหม่เอง
+    """
+    db = get_firestore_client()
+    categories_ref = (
+        db.collection('categories')
+        .where('user_id', '==', user_id)
+        .where('type', '==', category_type)
+    )
+    docs = list(categories_ref.stream())
+    result = []
+    for doc in docs:
+        d = doc.to_dict()
+        result.append({
+            'doc_id': doc.id,
+            'name': d.get('name', ''),
+            'group': d.get('group', CATEGORY_GROUP_GENERAL),
+        })
+    return sorted(result, key=lambda x: x['name'])
+
+
+def update_category_group(doc_id, new_group):
+    """🆕 แก้ไขกลุ่มของหมวดหมู่ที่มีอยู่แล้ว (ใช้กับหน้าจัดการกลุ่มหมวดหมู่ สำหรับจัดหมวดหมู่เก่าย้อนหลัง)"""
+    db = get_firestore_client()
+    db.collection('categories').document(doc_id).update({'group': new_group})
+
+
+def add_category_if_new(name, category_type, user_id, group=None):
+    """
+    เพิ่มหมวดหมู่ใหม่ลง Firestore ถ้าผู้ใช้คนนี้ยังไม่มีหมวดหมู่นี้อยู่แล้ว (กันหมวดหมู่ซ้ำ)
+    🆕 เพิ่มพารามิเตอร์ group — ถ้าไม่ระบุ จะเป็น "ค่าใช้จ่ายทั่วไป" โดยอัตโนมัติ (เช่น หมวดหมู่ที่
+    AI สร้างจากการพูด/พิมพ์เอง) ส่วนหมวดหมู่ที่มาจากการอ่านสลิปเงินเดือน จะระบุ group ตรงๆ มาจาก
+    ตอนเรียกใช้ (ดู extract_transactions_from_image ด้านล่าง)
+    """
+    if group is None:
+        group = CATEGORY_GROUP_GENERAL
     db = get_firestore_client()
     existing = load_categories(category_type, user_id)
     if name not in existing:
-        db.collection('categories').add({'name': name, 'type': category_type, 'user_id': user_id})
+        db.collection('categories').add({
+            'name': name, 'type': category_type, 'user_id': user_id, 'group': group,
+        })
 
 
 # =============================================================
@@ -270,11 +322,13 @@ IMAGE_EXTRACT_PROMPT_TEMPLATE = """คุณเป็นผู้ช่วยอ
 อ่านรูปภาพนี้ แล้วแยกทุกรายการย่อยที่เห็นออกมา (ห้ามเอายอดรวม/ยอดสุทธิ เอาแค่รายการย่อยแต่ละบรรทัด)
 
 รายการฝั่ง "รายรับ" (Income) เช่น เงินเดือน (Salary), ค่าเบี้ยเลี้ยงที่พัก (Housing Allowance),
-ค่าโทรศัพท์ (Mobile Allowance) → type = "income"
+ค่าโทรศัพท์ (Mobile Allowance) → type = "income", group = "ค่าใช้จ่ายทั่วไป"
 
 รายการฝั่ง "รายการหัก/Deduction" เช่น ประกันสังคม (Social Welfare Fund), กองทุนสำรองเลี้ยงชีพ
 (Provident Fund/PVD), ภาษีหัก ณ ที่จ่าย (Withholding tax), สหกรณ์ (Cooperatives)
-→ type = "expense" (เพราะเป็นเงินที่ถูกหักออกไป เหมือนรายจ่ายอย่างหนึ่ง)
+→ type = "expense" (เพราะเป็นเงินที่ถูกหักออกไป เหมือนรายจ่ายอย่างหนึ่ง), group = "รายการหักจากเงินเดือน"
+(เพราะเป็นเงินที่ถูกหักอัตโนมัติ ไม่ใช่รายจ่ายที่ตัดสินใจใช้เองในชีวิตประจำวัน — แยกกลุ่มไว้เพื่อไม่ให้
+ตัวเลขก้อนใหญ่จากรายการหักพวกนี้ไปกลบค่าใช้จ่ายทั่วไปที่มักมีมูลค่าน้อยกว่ามากในกราฟสรุป)
 
 หมวดหมู่รายจ่ายที่มีอยู่แล้ว: {expense_categories}
 หมวดหมู่รายรับที่มีอยู่แล้ว: {income_categories}
@@ -288,7 +342,8 @@ IMAGE_EXTRACT_PROMPT_TEMPLATE = """คุณเป็นผู้ช่วยอ
     "amount": <ตัวเลขจำนวนเงิน ไม่มีหน่วย ไม่มีคอมมา>,
     "type": "income หรือ expense",
     "category": "<ชื่อหมวดหมู่ — เลือกจากรายการที่มีอยู่แล้วถ้าตรงกัน ถ้าไม่ตรงเลยให้ตั้งชื่อหมวดหมู่ใหม่ที่เหมาะสมสั้นๆ กระชับ>",
-    "is_new_category": <true หรือ false>
+    "is_new_category": <true หรือ false>,
+    "group": "ค่าใช้จ่ายทั่วไป หรือ รายการหักจากเงินเดือน (ตามที่อธิบายไว้ข้างบน)"
   }}
 ]
 
