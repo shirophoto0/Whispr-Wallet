@@ -126,6 +126,47 @@ def delete_transaction(doc_id):
     st.cache_data.clear()
 
 
+def delete_transactions_by_month(user_id, year, month):
+    """
+    🆕 ลบรายการทั้งหมดของผู้ใช้คนนี้ในเดือน/ปีที่ระบุ (ใช้กับปุ่ม "ล้างข้อมูลเฉพาะเดือน")
+    คืนค่าเป็นจำนวนรายการที่ลบไปทั้งหมด
+    """
+    db = get_firestore_client()
+    docs = db.collection('transactions').where('user_id', '==', user_id).stream()
+    count = 0
+    for doc in docs:
+        _date_str = doc.to_dict().get('date', '')
+        try:
+            _d = datetime.strptime(_date_str, '%Y-%m-%d')
+            if _d.year == year and _d.month == month:
+                doc.reference.delete()
+                count += 1
+        except ValueError:
+            continue
+    st.cache_data.clear()
+    return count
+
+
+def delete_all_transactions(user_id):
+    """
+    🆕 ลบรายการทั้งหมดของผู้ใช้คนนี้แบบไม่มีเงื่อนไข (ใช้กับปุ่ม "ล้างข้อมูลทั้งหมด")
+    คืนค่าเป็นจำนวนรายการที่ลบไปทั้งหมด — ใช้ batch delete เพื่อความเร็ว (เร็วกว่าลบทีละตัว)
+    """
+    db = get_firestore_client()
+    docs = list(db.collection('transactions').where('user_id', '==', user_id).stream())
+    count = len(docs)
+
+    # ลบเป็นชุด (batch) ครั้งละไม่เกิน 500 รายการต่อ batch (ข้อจำกัดของ Firestore)
+    for i in range(0, len(docs), 500):
+        batch = db.batch()
+        for doc in docs[i:i + 500]:
+            batch.delete(doc.reference)
+        batch.commit()
+
+    st.cache_data.clear()
+    return count
+
+
 def update_transaction(doc_id, trans_date, trans_type, amount, category, description):
     """แก้ไขรายการที่มีอยู่แล้วใน Firestore ตาม document ID (ไม่สร้างรายการใหม่ อัปเดตของเดิม)"""
     db = get_firestore_client()
