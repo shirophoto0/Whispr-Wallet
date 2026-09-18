@@ -1,10 +1,12 @@
 # =============================================================
 # App.py
 # แอปบันทึกรายรับ-รายจ่ายส่วนตัว — รองรับพิมพ์เอง + พูดบันทึก (AI แปลงเสียง+จัดหมวดหมู่อัตโนมัติ)
+# 🆕 มีระบบ Login แยกผู้ใช้ (คนละบัญชี เห็นแค่ข้อมูลตัวเอง)
 # =============================================================
 import streamlit as st
 import pandas as pd
 from datetime import date
+from auth import check_login, show_user_bar
 from backend_functions import (
     load_categories, add_category_if_new, save_transaction,
     load_transactions, delete_transaction, transcribe_audio, categorize_with_ai,
@@ -12,11 +14,19 @@ from backend_functions import (
 
 st.set_page_config(page_title="บันทึกรายรับ-รายจ่าย", page_icon="💰", layout="wide")
 
+# 🆕 เช็ค Login ก่อนเสมอ — ถ้ายังไม่ได้ login จะแสดงฟอร์ม login แล้วหยุดทำงานตรงนี้เลย
+# (ไม่รันโค้ดส่วนที่เหลือของแอปต่อ กันคนที่ไม่มีสิทธิ์เข้าเห็นข้อมูล)
+if not check_login():
+    st.stop()
+
+show_user_bar()
+current_user = st.session_state['username']
+
 st.title("💰 บันทึกรายรับ-รายจ่ายส่วนตัว")
 
-# โหลดหมวดหมู่ทั้งหมดไว้ล่วงหน้า (ใช้ทั้งฝั่งพิมพ์เองและฝั่ง AI)
-expense_categories = load_categories('expense')
-income_categories = load_categories('income')
+# โหลดหมวดหมู่ทั้งหมดไว้ล่วงหน้า (เฉพาะของผู้ใช้คนนี้เท่านั้น — ใช้ทั้งฝั่งพิมพ์เองและฝั่ง AI)
+expense_categories = load_categories('expense', current_user)
+income_categories = load_categories('income', current_user)
 
 tab_record, tab_history, tab_summary = st.tabs(["📝 บันทึกรายการ", "📜 ประวัติรายการ", "📊 สรุปภาพรวม"])
 
@@ -60,14 +70,14 @@ with tab_record:
                             final_category = ai_result.get('category', 'อื่นๆ')
                             if ai_result.get('is_new_category'):
                                 st.info(f"🆕 AI สร้างหมวดหมู่ใหม่ให้: **{final_category}**")
-                                add_category_if_new(final_category, type_code)
+                                add_category_if_new(final_category, type_code, current_user)
                         except Exception as e:
                             st.warning(f"AI จัดหมวดหมู่ไม่สำเร็จ ใช้หมวด 'อื่นๆ' แทน: {e}")
                             final_category = "อื่นๆ"
                 else:
                     final_category = category_choice
 
-                save_transaction(trans_date, type_code, amount, final_category, description, "manual")
+                save_transaction(trans_date, type_code, amount, final_category, description, "manual", current_user)
                 st.cache_data.clear()
                 st.success(f"✅ บันทึกสำเร็จ! {trans_type} {amount:,.2f} บาท ({final_category})")
                 st.rerun()
@@ -132,8 +142,8 @@ with tab_record:
                             st.warning("กรุณาระบุจำนวนเงินมากกว่า 0 ครับ")
                         else:
                             type_code = "expense" if confirm_type == "รายจ่าย" else "income"
-                            add_category_if_new(confirm_category, type_code)
-                            save_transaction(confirm_date, type_code, confirm_amount, confirm_category, confirm_description, "voice")
+                            add_category_if_new(confirm_category, type_code, current_user)
+                            save_transaction(confirm_date, type_code, confirm_amount, confirm_category, confirm_description, "voice", current_user)
                             st.cache_data.clear()
                             st.success(f"✅ บันทึกสำเร็จ! {confirm_type} {confirm_amount:,.2f} บาท ({confirm_category})")
                             st.rerun()
@@ -142,7 +152,7 @@ with tab_record:
 # แท็บ 2: ประวัติรายการ
 # =============================================================
 with tab_history:
-    transactions = load_transactions()
+    transactions = load_transactions(current_user)
 
     if not transactions:
         st.info("ยังไม่มีรายการบันทึกไว้เลยครับ")
@@ -172,7 +182,7 @@ with tab_history:
 # แท็บ 3: สรุปภาพรวม
 # =============================================================
 with tab_summary:
-    transactions = load_transactions()
+    transactions = load_transactions(current_user)
 
     if not transactions:
         st.info("ยังไม่มีข้อมูลให้สรุปครับ")
