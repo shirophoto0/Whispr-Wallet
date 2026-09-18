@@ -216,3 +216,77 @@ def categorize_with_ai(user_text, expense_categories, income_categories):
 
     parsed = json.loads(json_match.group(0))
     return parsed
+
+
+# =============================================================
+# ส่วนที่ 6: อ่านรูปภาพเอกสารการเงิน (เช่น สลิปเงินเดือน) ด้วย Claude แล้วแยกเป็นรายการย่อยๆ
+# 🆕 เหมือนกับที่ stock-scanner ใช้ AI อ่านรูปสลิป PVD — แต่ที่นี่แยกทั้งฝั่ง "รายรับ" (เงินเดือน,
+# ค่าเบี้ยเลี้ยง) และฝั่ง "รายการหัก/Deduction" (ประกันสังคม, PVD, ภาษี, สหกรณ์) ออกมาเป็นรายการ
+# ย่อยพร้อมกันในครั้งเดียว เพราะสลิปเงินเดือน 1 ใบ มักมีทั้ง 2 ฝั่งpanel อยู่ในรูปเดียวกัน
+# =============================================================
+IMAGE_EXTRACT_PROMPT_TEMPLATE = """คุณเป็นผู้ช่วยอ่านเอกสารทางการเงิน เช่น สลิปเงินเดือน ใบเสร็จ
+อ่านรูปภาพนี้ แล้วแยกทุกรายการย่อยที่เห็นออกมา (ห้ามเอายอดรวม/ยอดสุทธิ เอาแค่รายการย่อยแต่ละบรรทัด)
+
+รายการฝั่ง "รายรับ" (Income) เช่น เงินเดือน (Salary), ค่าเบี้ยเลี้ยงที่พัก (Housing Allowance),
+ค่าโทรศัพท์ (Mobile Allowance) → type = "income"
+
+รายการฝั่ง "รายการหัก/Deduction" เช่น ประกันสังคม (Social Welfare Fund), กองทุนสำรองเลี้ยงชีพ
+(Provident Fund/PVD), ภาษีหัก ณ ที่จ่าย (Withholding tax), สหกรณ์ (Cooperatives)
+→ type = "expense" (เพราะเป็นเงินที่ถูกหักออกไป เหมือนรายจ่ายอย่างหนึ่ง)
+
+หมวดหมู่รายจ่ายที่มีอยู่แล้ว: {expense_categories}
+หมวดหมู่รายรับที่มีอยู่แล้ว: {income_categories}
+
+กรุณาตอบกลับเป็น JSON เท่านั้น ห้ามมีข้อความอื่นนอกเหนือจาก JSON เลยแม้แต่คำเดียว ห้ามใส่ ```json ครอบ
+ตอบเริ่มต้นด้วยเครื่องหมาย [ ทันที ตามโครงสร้างนี้เป๊ะๆ (เป็น list เพราะมีหลายรายการ):
+
+[
+  {{
+    "description": "<ชื่อรายการตามที่เห็นในรูป แปลเป็นภาษาไทยถ้าเป็นภาษาอังกฤษ>",
+    "amount": <ตัวเลขจำนวนเงิน ไม่มีหน่วย ไม่มีคอมมา>,
+    "type": "income หรือ expense",
+    "category": "<ชื่อหมวดหมู่ — เลือกจากรายการที่มีอยู่แล้วถ้าตรงกัน ถ้าไม่ตรงเลยให้ตั้งชื่อหมวดหมู่ใหม่ที่เหมาะสมสั้นๆ กระชับ>",
+    "is_new_category": <true หรือ false>
+  }}
+]
+
+ถ้าอ่านรูปไม่ออกเลย หรือไม่ใช่เอกสารการเงิน ให้ตอบเป็น [] (list ว่างเปล่า)"""
+
+
+def extract_transactions_from_image(image_bytes, media_type, expense_categories, income_categories):
+    """
+    ส่งรูปภาพไปให้ Claude อ่าน แยกเป็นรายการย่อยๆ (ทั้งรายรับและรายจ่าย/รายการหัก) คืนค่าเป็น
+    list ของ dict — Claude รองรับรับรูปภาพโดยตรงอยู่แล้ว (ต่างจากเสียงที่ต้องผ่าน Groq ก่อน)
+    ไม่ต้องผ่านบริการ OCR แยกต่างหากเลย
+    """
+    import anthropic
+    import base64
+    client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+
+    base64_image = base64.standard_b64encode(image_bytes).decode("utf-8")
+
+    prompt = (
+        IMAGE_EXTRACT_PROMPT_TEMPLATE
+        .replace("{expense_categories}", ", ".join(expense_categories))
+        .replace("{income_categories}", ", ".join(income_categories))
+    )
+
+    response = client.messages.create(
+        model="claude-sonnet-5",
+        max_tokens=1500,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": base64_image}},
+                {"type": "text", "text": prompt},
+            ],
+        }],
+    )
+    result_text = "".join(block.text for block in response.content if block.type == "text")
+
+    # แกะ JSON list ออกจากคำตอบด้วย Regex (ทนทานกว่าการเช็คแค่ว่าขึ้นต้นด้วย ```json)
+    json_match = re.search(r'\[.*\]', result_text, re.DOTALL)
+    if not json_match:
+        raise ValueError(f"AI ไม่ได้ตอบกลับมาเป็น JSON list: {result_text[:200]}")
+
+    return json.loads(json_match.group(0))
