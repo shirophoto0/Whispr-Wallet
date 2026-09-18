@@ -306,7 +306,11 @@ elif selected_menu == "ประวัติรายการ":
 
         selected_rows = event.selection.rows if event and event.selection else []
 
-        if selected_rows:
+        # 🔧 แก้บั๊ก: เดิมถ้าเคยเลือกแถวไว้ (เช่น แถวสุดท้าย) แล้วลบรายการไปจนรายการเหลือน้อยลง
+        # selection state ของตาราง (เก็บไว้ใน session_state ตาม key="history_table") จะยังค้าง
+        # index เดิมอยู่ข้ามการรีเฟรชหน้า พอ index เดิมเกินขอบเขตของรายการที่เหลืออยู่จริง จะเกิด
+        # IndexError ทันที ตอนนี้เช็คขอบเขตก่อนเข้าถึงเสมอ ถ้าเกินขอบเขตให้ถือว่าไม่มีอะไรถูกเลือก
+        if selected_rows and selected_rows[0] < len(transactions):
             selected_idx = selected_rows[0]
             selected_transaction = transactions[selected_idx]
 
@@ -357,11 +361,16 @@ elif selected_menu == "ประวัติรายการ":
                         selected_transaction['id'], edit_date, edit_type_code,
                         edit_amount, edit_category, edit_description
                     )
+                    # 🆕 ล้าง selection ของตารางทิ้งก่อน rerun เสมอ กันปัญหา index ค้างข้ามรีเฟรช
+                    st.session_state.pop("history_table", None)
                     st.success("✅ แก้ไขสำเร็จ!")
                     st.rerun()
 
             if delete_edit:
                 delete_transaction(selected_transaction['id'])
+                # 🆕 ล้าง selection ของตารางทิ้งก่อน rerun เสมอ (จุดสำคัญที่สุด เพราะการลบทำให้
+                # จำนวนรายการลดลงจริง เสี่ยง index เกินขอบเขตมากที่สุดในบรรดาการกระทำทั้งหมด)
+                st.session_state.pop("history_table", None)
                 st.success("ลบสำเร็จ")
                 st.rerun()
 
