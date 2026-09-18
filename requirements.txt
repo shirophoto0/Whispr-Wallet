@@ -1,0 +1,6 @@
+streamlit
+pandas
+firebase-admin
+anthropic
+groq
+streamlit-mic-recorder
