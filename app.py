@@ -16,6 +16,8 @@ from backend_functions import (
     load_transactions, delete_transaction, update_transaction,
     delete_transactions_by_month, delete_all_transactions,
     transcribe_audio, categorize_with_ai, extract_transactions_from_image,
+    load_categories_with_group, update_category_group,
+    CATEGORY_GROUP_GENERAL, CATEGORY_GROUP_PAYROLL,
 )
 
 st.set_page_config(page_title="บันทึกรายรับ-รายจ่าย", page_icon="💰", layout="wide")
@@ -217,7 +219,13 @@ def render_image_entry():
         st.markdown("##### ✅ ตรวจสอบรายการที่ AI อ่านได้ก่อนบันทึก (แก้ไขในตารางได้เลย)")
         shared_date = st.date_input("วันที่ของเอกสารนี้ (ใช้กับทุกรายการที่อ่านได้)", value=date.today(), key="image_shared_date")
 
-        edit_df = pd.DataFrame(st.session_state['extracted_items'])[['description', 'amount', 'type', 'category']]
+        # 🆕 เพิ่มคอลัมน์ "group" ให้แก้ไขได้ในตารางด้วย (AI จัดกลุ่มมาให้อัตโนมัติแล้ว แต่ยัง
+        # ปรับแก้เองได้ก่อนบันทึกจริง เผื่อ AI จัดผิดกลุ่มบางรายการ)
+        _raw_extracted = pd.DataFrame(st.session_state['extracted_items'])
+        if 'group' not in _raw_extracted.columns:
+            _raw_extracted['group'] = CATEGORY_GROUP_GENERAL  # กันไว้เผื่อ AI ตอบมาไม่ครบ field
+
+        edit_df = _raw_extracted[['description', 'amount', 'type', 'category', 'group']]
         edited_df = st.data_editor(
             edit_df, use_container_width=True, hide_index=True, key="image_edit_table",
             column_config={
@@ -225,6 +233,9 @@ def render_image_entry():
                 "amount": st.column_config.NumberColumn("จำนวนเงิน", format="%.2f", min_value=0.0),
                 "type": st.column_config.SelectboxColumn("ประเภท", options=["income", "expense"]),
                 "category": st.column_config.TextColumn("หมวดหมู่"),
+                "group": st.column_config.SelectboxColumn(
+                    "กลุ่ม", options=[CATEGORY_GROUP_GENERAL, CATEGORY_GROUP_PAYROLL]
+                ),
             },
             num_rows="dynamic",  # ลบ/เพิ่มแถวเองได้ เผื่อ AI อ่านผิดหรือตกหล่นบางรายการ
         )
@@ -239,7 +250,7 @@ def render_image_entry():
                 _count = 0
                 for _, row in edited_df.iterrows():
                     if row['amount'] > 0 and row['description']:
-                        add_category_if_new(row['category'], row['type'], current_user)
+                        add_category_if_new(row['category'], row['type'], current_user, group=row['group'])
                         save_transaction(shared_date, row['type'], row['amount'], row['category'], row['description'], "image", current_user)
                         _count += 1
                 st.cache_data.clear()
@@ -261,24 +272,54 @@ if selected_menu == "บันทึกรายการ":
     # 🆕 เพิ่มหมวดหมู่เองได้โดยตรง — ไม่ต้องพึ่ง AI สร้างให้อัตโนมัติเท่านั้น เผื่ออยากเพิ่มหมวดหมู่
     # ที่รู้อยู่แล้วว่าจะใช้บ่อยไว้ล่วงหน้าเลย (เช่น หมวดหมู่ที่เพิ่งเปลี่ยนแปลงมาจากค่าเริ่มต้น แต่
     # บัญชีนี้เคยสร้างหมวดหมู่ไปแล้วก่อนหน้า ค่าเริ่มต้นใหม่จะไม่ถูกเพิ่มให้อัตโนมัติอีก)
-    with st.expander("➕ เพิ่มหมวดหมู่เอง"):
-        with st.form("add_category_form", clear_on_submit=True):
-            ac1, ac2 = st.columns([1, 2])
-            with ac1:
-                new_cat_type = st.radio("ประเภท", ["รายรับ", "รายจ่าย"], horizontal=True, key="new_cat_type")
-            with ac2:
-                new_cat_name = st.text_input("ชื่อหมวดหมู่ใหม่", placeholder="เช่น ปันผลหุ้น", key="new_cat_name")
-            add_cat_submitted = st.form_submit_button("➕ เพิ่มหมวดหมู่นี้", type="primary")
+    # 🆕 เพิ่มแท็บที่ 2 "จัดกลุ่มหมวดหมู่รายจ่าย" — สำหรับหมวดหมู่เก่าที่สร้างไว้ก่อนมีฟีเจอร์แยกกลุ่ม
+    # (รายการหักจากเงินเดือน vs ค่าใช้จ่ายทั่วไป) ซึ่งยังไม่มีข้อมูลกลุ่มนี้เก็บไว้เลย ต้องมาจัดย้อนหลัง
+    with st.expander("➕ จัดการหมวดหมู่ (เพิ่มใหม่ / จัดกลุ่ม)"):
+        manage_tab1, manage_tab2 = st.tabs(["เพิ่มหมวดหมู่ใหม่", "จัดกลุ่มหมวดหมู่รายจ่าย"])
 
-        if add_cat_submitted:
-            if not new_cat_name.strip():
-                st.warning("กรุณาพิมพ์ชื่อหมวดหมู่ก่อนครับ")
+        with manage_tab1:
+            with st.form("add_category_form", clear_on_submit=True):
+                ac1, ac2 = st.columns([1, 2])
+                with ac1:
+                    new_cat_type = st.radio("ประเภท", ["รายรับ", "รายจ่าย"], horizontal=True, key="new_cat_type")
+                with ac2:
+                    new_cat_name = st.text_input("ชื่อหมวดหมู่ใหม่", placeholder="เช่น ปันผลหุ้น", key="new_cat_name")
+                add_cat_submitted = st.form_submit_button("➕ เพิ่มหมวดหมู่นี้", type="primary")
+
+            if add_cat_submitted:
+                if not new_cat_name.strip():
+                    st.warning("กรุณาพิมพ์ชื่อหมวดหมู่ก่อนครับ")
+                else:
+                    _type_code = "income" if new_cat_type == "รายรับ" else "expense"
+                    add_category_if_new(new_cat_name.strip(), _type_code, current_user)
+                    st.success(f"✅ เพิ่มหมวดหมู่ '{new_cat_name.strip()}' ({new_cat_type}) สำเร็จแล้ว")
+                    st.cache_data.clear()
+                    st.rerun()
+
+        with manage_tab2:
+            st.caption(
+                "แยก \"รายการหักจากเงินเดือน\" (ประกันสังคม, PVD, ภาษี, สหกรณ์) ออกจาก \"ค่าใช้จ่ายทั่วไป\" "
+                "(ใช้จ่ายจริงในชีวิตประจำวัน) เพื่อกรองดูแยกกันได้ในหน้าสรุปภาพรวม — เปลี่ยนตรงนี้แล้วบันทึกทันที"
+            )
+            _cats_with_group = load_categories_with_group('expense', current_user)
+            if not _cats_with_group:
+                st.caption("ยังไม่มีหมวดหมู่รายจ่ายเลยครับ")
             else:
-                _type_code = "income" if new_cat_type == "รายรับ" else "expense"
-                add_category_if_new(new_cat_name.strip(), _type_code, current_user)
-                st.success(f"✅ เพิ่มหมวดหมู่ '{new_cat_name.strip()}' ({new_cat_type}) สำเร็จแล้ว")
-                st.cache_data.clear()
-                st.rerun()
+                for _cat in _cats_with_group:
+                    gc1, gc2 = st.columns([2, 2])
+                    with gc1:
+                        st.markdown(f"**{_cat['name']}**")
+                    with gc2:
+                        _new_group = st.selectbox(
+                            "กลุ่ม", [CATEGORY_GROUP_GENERAL, CATEGORY_GROUP_PAYROLL],
+                            index=0 if _cat['group'] == CATEGORY_GROUP_GENERAL else 1,
+                            key=f"group_select_{_cat['doc_id']}",
+                            label_visibility="collapsed"
+                        )
+                        if _new_group != _cat['group']:
+                            update_category_group(_cat['doc_id'], _new_group)
+                            st.cache_data.clear()
+                            st.rerun()
 
     # 🔧 ปรับปรุง: สลับให้แท็บ "รายจ่าย" เป็นแท็บซ้ายสุด (Streamlit เปิดแท็บซ้ายสุดเป็นค่าเริ่มต้น
     # เสมอ) เพราะใช้บันทึกรายจ่ายบ่อยกว่ารายรับมากในชีวิตประจำวัน — สลับแค่ตำแหน่งการแสดงผล ตัวแปร
@@ -560,10 +601,28 @@ elif selected_menu == "สรุปภาพรวม":
             st.divider()
             st.markdown("##### 📊 รายจ่ายแยกตามหมวดหมู่")
 
-            expense_by_cat = filtered_df[filtered_df['type'] == 'expense'].groupby('category')['amount'].sum().sort_values(ascending=False)
+            # 🆕 ตัวกรองกลุ่ม — แยกดู "รายการหักจากเงินเดือน" ออกจาก "ค่าใช้จ่ายทั่วไป" ได้ เพราะ
+            # รายการหักมักมีมูลค่าสูงกว่าค่าใช้จ่ายทั่วไปมาก ถ้าไม่แยกดู จะบดบังค่าใช้จ่ายทั่วไปใน
+            # กราฟจนมองแทบไม่เห็นเลย (ตัวกรองนี้มีผลแค่กราฟด้านล่างเท่านั้น ไม่กระทบการ์ดสรุปด้านบน
+            # ซึ่งควรยังคงแสดงยอดรวมที่แท้จริงเสมอ)
+            _cats_with_group_all = load_categories_with_group('expense', current_user)
+            _category_to_group = {c['name']: c['group'] for c in _cats_with_group_all}
+
+            group_filter_choice = st.radio(
+                "กรองตามกลุ่ม", ["ทั้งหมด", CATEGORY_GROUP_GENERAL, CATEGORY_GROUP_PAYROLL],
+                horizontal=True, key="summary_group_filter"
+            )
+
+            expense_df = filtered_df[filtered_df['type'] == 'expense'].copy()
+            expense_df['group'] = expense_df['category'].map(_category_to_group).fillna(CATEGORY_GROUP_GENERAL)
+
+            if group_filter_choice != "ทั้งหมด":
+                expense_df = expense_df[expense_df['group'] == group_filter_choice]
+
+            expense_by_cat = expense_df.groupby('category')['amount'].sum().sort_values(ascending=False)
 
             if expense_by_cat.empty:
-                st.caption("ยังไม่มีรายการรายจ่ายในช่วงเวลานี้เลย")
+                st.caption("ยังไม่มีรายการรายจ่ายในช่วงเวลา/กลุ่มนี้เลย")
             else:
                 # 🆕 แบ่งครึ่งหน้าจอ — กราฟแท่งด้านซ้าย + กราฟ Donut ด้านขวา (ใช้ข้อมูลเดียวกัน
                 # คนละมุมมอง: แท่งช่วยเทียบขนาดตรงๆ ส่วน Donut เห็นสัดส่วนโดยรวมชัดกว่า)
