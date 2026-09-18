@@ -274,7 +274,11 @@ def extract_transactions_from_image(image_bytes, media_type, expense_categories,
 
     response = client.messages.create(
         model="claude-sonnet-5",
-        max_tokens=1500,
+        # 🔧 แก้บั๊ก: เดิมตั้งไว้แค่ 1500 ไม่พอสำหรับสลิปที่มีหลายรายการ (แต่ละรายการมี description,
+        # amount, type, category, is_new_category ใน JSON — ยิ่งรายการเยอะยิ่งใช้ token มาก) ทำให้
+        # คำตอบถูกตัดกลางคันบ่อยๆ (สังเกตได้จาก error ที่ AI "ตอบ JSON list มาจริง" แต่ไม่มี ] ปิดท้าย
+        # เลย ยืนยันว่าชนขีดจำกัดจริง ไม่ใช่ AI ตอบผิดรูปแบบเอง) เพิ่มเป็น 3000 ให้มีที่เขียนพอ
+        max_tokens=3000,
         messages=[{
             "role": "user",
             "content": [
@@ -284,6 +288,14 @@ def extract_transactions_from_image(image_bytes, media_type, expense_categories,
         }],
     )
     result_text = "".join(block.text for block in response.content if block.type == "text")
+
+    # 🆕 เช็คว่าคำตอบถูกตัดกลางคันเพราะชน max_tokens อีกไหม (เผื่ออนาคตมีสลิปที่ยาวกว่านี้อีก)
+    # จะได้รู้สาเหตุทันทีแทนที่จะเดา
+    if response.stop_reason == "max_tokens":
+        raise ValueError(
+            "AI อ่านรูปภาพได้บางส่วนแต่คำตอบยาวเกินขีดจำกัดที่ตั้งไว้ (max_tokens) "
+            "ลองอัปโหลดรูปที่มีรายการน้อยลง หรือแจ้งผู้พัฒนาให้เพิ่ม max_tokens อีกครั้ง"
+        )
 
     # แกะ JSON list ออกจากคำตอบด้วย Regex (ทนทานกว่าการเช็คแค่ว่าขึ้นต้นด้วย ```json)
     json_match = re.search(r'\[.*\]', result_text, re.DOTALL)
