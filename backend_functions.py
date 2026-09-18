@@ -1,553 +1,346 @@
 # =============================================================
-# App.py
-# แอปบันทึกรายรับ-รายจ่ายส่วนตัว — รองรับพิมพ์เอง + พูดบันทึก + อ่านจากรูปภาพ (AI แปลงเสียง/รูปภาพ
-# + จัดหมวดหมู่อัตโนมัติ) มีระบบ Login แยกผู้ใช้ (คนละบัญชี เห็นแค่ข้อมูลตัวเอง)
-# 🆕 ปรับโครงสร้างเมนูจากแท็บแนวนอนด้านบน มาเป็นเมนู Sidebar แนวตั้งด้านซ้ายแทน (เหมือนที่ปรับให้
-# stock-scanner ไปแล้วก่อนหน้านี้) และแยก "บันทึกรายการ" เป็น 2 แท็บย่อยแนวนอน (รายรับ/รายจ่าย)
+# backend_functions.py
+# รวมฟังก์ชันเบื้องหลังทั้งหมด: เชื่อม Firebase Firestore (เก็บข้อมูล), Groq (แปลงเสียงเป็น
+# ข้อความ), Claude (จัดหมวดหมู่รายการอัตโนมัติ)
 # =============================================================
 import streamlit as st
-import pandas as pd
-import plotly.graph_objects as go
-from datetime import date
-from auth import check_login, show_user_bar
-from theme import apply_theme, render_metric_card, get_theme_colors, style_plotly
-from backend_functions import (
-    load_categories, add_category_if_new, save_transaction,
-    load_transactions, delete_transaction, update_transaction,
-    delete_transactions_by_month, delete_all_transactions,
-    transcribe_audio, categorize_with_ai, extract_transactions_from_image,
-)
+import firebase_admin
+from firebase_admin import credentials, firestore
+from datetime import datetime, date
+import json
+import re
 
-st.set_page_config(page_title="บันทึกรายรับ-รายจ่าย", page_icon="💰", layout="wide")
-apply_theme()
-
-# เช็ค Login ก่อนเสมอ — ถ้ายังไม่ได้ login จะแสดงฟอร์ม login แล้วหยุดทำงานตรงนี้เลย
-if not check_login():
-    st.stop()
-
-show_user_bar()
-current_user = st.session_state['username']
-
-# โหลดหมวดหมู่ทั้งหมดไว้ล่วงหน้า (เฉพาะของผู้ใช้คนนี้เท่านั้น — ใช้ทุกส่วนของแอป)
-expense_categories = load_categories('expense', current_user)
-income_categories = load_categories('income', current_user)
+# หมวดหมู่เริ่มต้น — ใช้ตอนสร้างฐานข้อมูลครั้งแรก (ถ้ายังไม่มีเลยในระบบ)
+DEFAULT_EXPENSE_CATEGORIES = [
+    "อาหาร", "เดินทาง", "ที่พัก/บ้าน", "ช้อปปิ้ง", "บันเทิง",
+    "สุขภาพ", "การศึกษา", "ค่าน้ำค่าไฟ/สาธารณูปโภค", "อื่นๆ"
+]
+DEFAULT_INCOME_CATEGORIES = [
+    "เงินเดือน", "Stock Photo", "ปันผลหุ้น", "ปันผลกองทุน",
+    "ปันผลสหกรณ์", "รายได้เสริมอื่นๆ", "อื่นๆ"
+]
 
 
 # =============================================================
-# 🆕 เมนู Sidebar แนวตั้ง (แทนแท็บแนวนอนเดิม)
+# ส่วนที่ 1: เชื่อมต่อ Firebase Firestore
 # =============================================================
-from streamlit_option_menu import option_menu
+@st.cache_resource
+def get_firestore_client():
+    """
+    เชื่อมต่อ Firebase Firestore (แคชการเชื่อมต่อไว้ ไม่ต้องเชื่อมใหม่ทุกครั้งที่หน้าเว็บรันซ้ำ)
+    อ่าน Service Account JSON จาก Streamlit Secrets (ต้องตั้งค่าไว้ก่อนใช้งาน — ดูคำแนะนำท้ายไฟล์)
+    """
+    if not firebase_admin._apps:
+        cred_dict = dict(st.secrets["firebase_service_account"])
+        cred = credentials.Certificate(cred_dict)
+        firebase_admin.initialize_app(cred)
+    return firestore.client()
 
-with st.sidebar:
-    selected_menu = option_menu(
-        menu_title="💰 เมนูหลัก",
-        options=["บันทึกรายการ", "ประวัติรายการ", "สรุปภาพรวม"],
-        icons=["pencil-square", "clock-history", "bar-chart-line"],
-        default_index=0,
-        key="main_menu",
+
+# =============================================================
+# ส่วนที่ 2: จัดการหมวดหมู่ (Categories)
+# 🆕 แยกข้อมูลตามผู้ใช้ (user_id) — แต่ละคนมีชุดหมวดหมู่เป็นของตัวเอง ไม่ปนกัน เหมือนที่แยก
+# Google Sheet คนละไฟล์กันใน stock-scanner
+# =============================================================
+def load_categories(category_type, user_id):
+    """
+    โหลดรายชื่อหมวดหมู่ทั้งหมดของผู้ใช้คนนี้จาก Firestore (แยกตามประเภท 'income' หรือ 'expense')
+    ถ้ายังไม่เคยมีเลย จะสร้างหมวดหมู่เริ่มต้นให้อัตโนมัติในครั้งแรก
+    """
+    db = get_firestore_client()
+    categories_ref = (
+        db.collection('categories')
+        .where('user_id', '==', user_id)
+        .where('type', '==', category_type)
+    )
+    docs = list(categories_ref.stream())
+
+    if not docs:
+        # ยังไม่เคยมีหมวดหมู่เลย สร้างชุดเริ่มต้นให้อัตโนมัติ
+        default_list = DEFAULT_EXPENSE_CATEGORIES if category_type == 'expense' else DEFAULT_INCOME_CATEGORIES
+        for name in default_list:
+            db.collection('categories').add({'name': name, 'type': category_type, 'user_id': user_id})
+        return default_list
+
+    return sorted([doc.to_dict()['name'] for doc in docs])
+
+
+def add_category_if_new(name, category_type, user_id):
+    """เพิ่มหมวดหมู่ใหม่ลง Firestore ถ้าผู้ใช้คนนี้ยังไม่มีหมวดหมู่นี้อยู่แล้ว (กันหมวดหมู่ซ้ำ)"""
+    db = get_firestore_client()
+    existing = load_categories(category_type, user_id)
+    if name not in existing:
+        db.collection('categories').add({'name': name, 'type': category_type, 'user_id': user_id})
+
+
+# =============================================================
+# ส่วนที่ 3: บันทึก/โหลด/ลบ รายการรายรับ-รายจ่าย
+# 🆕 แยกข้อมูลตามผู้ใช้ (user_id) เช่นเดียวกัน — แต่ละคนเห็นแค่รายการของตัวเองเท่านั้น
+# =============================================================
+def save_transaction(trans_date, trans_type, amount, category, description, source, user_id):
+    """
+    บันทึกรายการลง Firestore
+    trans_type: 'income' หรือ 'expense'
+    source: 'manual' (พิมพ์เอง) หรือ 'voice' (พูดบันทึก)
+    """
+    db = get_firestore_client()
+    db.collection('transactions').add({
+        'date': str(trans_date),
+        'type': trans_type,
+        'amount': float(amount),
+        'category': category,
+        'description': description,
+        'source': source,
+        'user_id': user_id,
+        'created_at': datetime.now().isoformat(),
+    })
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_transactions(user_id):
+    """
+    โหลดรายการทั้งหมดของผู้ใช้คนนี้ เรียงจากล่าสุดไปเก่าสุด (แคช 30 วินาที กันโหลดซ้ำถี่เกินไป)
+    ⚠️ หมายเหตุสำคัญ: การกรองด้วย where('user_id', ...) ควบคู่กับ order_by('created_at', ...)
+    ต้องมี Composite Index ใน Firestore ก่อนถึงจะใช้งานได้ — ถ้าเจอ error ตอนใช้งานจริง Firestore
+    จะแสดงลิงก์ให้กดสร้าง Index ได้เลยในข้อความ error นั้น (กดลิงก์ กด Create แล้วรอ 1-2 นาที)
+    """
+    db = get_firestore_client()
+    docs = (
+        db.collection('transactions')
+        .where('user_id', '==', user_id)
+        .order_by('created_at', direction=firestore.Query.DESCENDING)
+        .stream()
+    )
+    results = []
+    for doc in docs:
+        d = doc.to_dict()
+        d['id'] = doc.id
+        results.append(d)
+    return results
+
+
+def delete_transaction(doc_id):
+    """ลบรายการออกจาก Firestore ตาม document ID"""
+    db = get_firestore_client()
+    db.collection('transactions').document(doc_id).delete()
+    st.cache_data.clear()
+
+
+def delete_transactions_by_month(user_id, year, month):
+    """
+    🆕 ลบรายการทั้งหมดของผู้ใช้คนนี้ในเดือน/ปีที่ระบุ (ใช้กับปุ่ม "ล้างข้อมูลเฉพาะเดือน")
+    คืนค่าเป็นจำนวนรายการที่ลบไปทั้งหมด
+    """
+    db = get_firestore_client()
+    docs = db.collection('transactions').where('user_id', '==', user_id).stream()
+    count = 0
+    for doc in docs:
+        _date_str = doc.to_dict().get('date', '')
+        try:
+            _d = datetime.strptime(_date_str, '%Y-%m-%d')
+            if _d.year == year and _d.month == month:
+                doc.reference.delete()
+                count += 1
+        except ValueError:
+            continue
+    st.cache_data.clear()
+    return count
+
+
+def delete_all_transactions(user_id):
+    """
+    🆕 ลบรายการทั้งหมดของผู้ใช้คนนี้แบบไม่มีเงื่อนไข (ใช้กับปุ่ม "ล้างข้อมูลทั้งหมด")
+    คืนค่าเป็นจำนวนรายการที่ลบไปทั้งหมด — ใช้ batch delete เพื่อความเร็ว (เร็วกว่าลบทีละตัว)
+    """
+    db = get_firestore_client()
+    docs = list(db.collection('transactions').where('user_id', '==', user_id).stream())
+    count = len(docs)
+
+    # ลบเป็นชุด (batch) ครั้งละไม่เกิน 500 รายการต่อ batch (ข้อจำกัดของ Firestore)
+    for i in range(0, len(docs), 500):
+        batch = db.batch()
+        for doc in docs[i:i + 500]:
+            batch.delete(doc.reference)
+        batch.commit()
+
+    st.cache_data.clear()
+    return count
+
+
+def update_transaction(doc_id, trans_date, trans_type, amount, category, description):
+    """แก้ไขรายการที่มีอยู่แล้วใน Firestore ตาม document ID (ไม่สร้างรายการใหม่ อัปเดตของเดิม)"""
+    db = get_firestore_client()
+    db.collection('transactions').document(doc_id).update({
+        'date': str(trans_date),
+        'type': trans_type,
+        'amount': float(amount),
+        'category': category,
+        'description': description,
+    })
+    st.cache_data.clear()
+
+
+# =============================================================
+# ส่วนที่ 4: แปลงเสียงเป็นข้อความ (Groq Whisper API)
+# =============================================================
+def transcribe_audio(audio_bytes):
+    """
+    ส่งไฟล์เสียง (bytes) ไปให้ Groq แปลงเป็นข้อความ คืนค่าเป็นข้อความที่แปลงได้
+    ใช้โมเดล whisper-large-v3-turbo (เร็วและรองรับภาษาไทยได้ดี)
+    """
+    from groq import Groq
+    client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+
+    # Groq API ต้องการไฟล์เป็น tuple (ชื่อไฟล์, ข้อมูลไฟล์)
+    transcription = client.audio.transcriptions.create(
+        file=("audio.wav", audio_bytes),
+        model="whisper-large-v3-turbo",
+        language="th",  # ระบุภาษาไทยตรงๆ ช่วยให้แปลงแม่นยำขึ้น
+        response_format="text",
+    )
+    return str(transcription).strip()
+
+
+# =============================================================
+# ส่วนที่ 5: ให้ Claude วิเคราะห์ข้อความ แล้วแยกจำนวนเงิน + จัดหมวดหมู่อัตโนมัติ
+# =============================================================
+CATEGORIZE_PROMPT_TEMPLATE = """คุณเป็นผู้ช่วยจัดการบัญชีรายรับ-รายจ่ายส่วนตัว
+อ่านข้อความนี้แล้วแยกข้อมูลออกมา: "{user_text}"
+
+ประเภทที่เป็นไปได้: "income" (รายรับ) หรือ "expense" (รายจ่าย)
+
+หมวดหมู่รายจ่ายที่มีอยู่แล้ว: {expense_categories}
+หมวดหมู่รายรับที่มีอยู่แล้ว: {income_categories}
+
+กรุณาตอบกลับเป็น JSON เท่านั้น ห้ามมีข้อความอื่นนอกเหนือจาก JSON เลยแม้แต่คำเดียว ห้ามใส่ ```json ครอบ
+ตอบเริ่มต้นด้วยเครื่องหมาย {{ ทันที ตามโครงสร้างนี้เป๊ะๆ:
+
+{{
+  "type": "income หรือ expense",
+  "amount": <ตัวเลขจำนวนเงิน ไม่มีหน่วย ไม่มีคอมมา>,
+  "category": "<ชื่อหมวดหมู่ — เลือกจากรายการที่มีอยู่แล้วถ้าตรงกัน ถ้าไม่ตรงเลยให้ตั้งชื่อหมวดหมู่ใหม่ที่เหมาะสมสั้นๆ กระชับ>",
+  "is_new_category": <true หรือ false — true ถ้าหมวดหมู่นี้ไม่เคยมีอยู่ในรายการเดิมเลย>,
+  "description": "<คำอธิบายรายการสั้นๆ ตามที่ผู้ใช้พูด/พิมพ์มา>"
+}}
+
+หากแยกจำนวนเงินไม่ได้เลย ให้ใส่ amount เป็น 0"""
+
+
+def categorize_with_ai(user_text, expense_categories, income_categories):
+    """
+    ส่งข้อความไปให้ Claude วิเคราะห์ แยกจำนวนเงิน+ประเภท+หมวดหมู่ คืนค่าเป็น dict
+    ถ้า AI เห็นว่าควรสร้างหมวดหมู่ใหม่ จะไม่สร้างให้อัตโนมัติทันที — ให้ผู้ใช้ยืนยันก่อนเสมอ
+    (แสดงในหน้ายืนยันรายการ) เพื่อกันหมวดหมู่ใหม่ที่ไม่ตั้งใจ/สะกดผิดเพี้ยนเข้าไปในระบบ
+    """
+    import anthropic
+    client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+
+    # ใช้ .replace() แทน .format() เพราะข้อความที่ผู้ใช้พิมพ์/พูดมา อาจมีเครื่องหมายปีกกา {} ปนอยู่
+    # โดยบังเอิญ ซึ่งจะไปชนกับ syntax ของ .format() ทำให้ error ได้
+    prompt = (
+        CATEGORIZE_PROMPT_TEMPLATE
+        .replace("{user_text}", user_text)
+        .replace("{expense_categories}", ", ".join(expense_categories))
+        .replace("{income_categories}", ", ".join(income_categories))
     )
 
+    response = client.messages.create(
+        model="claude-sonnet-5",
+        max_tokens=500,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    result_text = "".join(block.text for block in response.content if block.type == "text")
 
-# =============================================================
-# ฟังก์ชันย่อย: ฟอร์มบันทึกรายการแบบพิมพ์เอง (ใช้ร่วมกันทั้งแท็บรายรับ/รายจ่าย)
-# fixed_type ถูกกำหนดตายตัวตามแท็บที่เรียกใช้ ('income' หรือ 'expense') — ผู้ใช้เลือกแท็บเองอยู่
-# แล้ว จึงไม่ต้องมีตัวเลือก "ประเภท" ซ้ำอีกในฟอร์ม ลดขั้นตอนความสับสนลง
-# =============================================================
-def render_manual_entry(fixed_type, fixed_type_label):
-    category_list = income_categories if fixed_type == 'income' else expense_categories
+    # แกะ JSON ออกจากคำตอบด้วย Regex (ทนทานกว่าการเช็คแค่ว่าขึ้นต้นด้วย ```json)
+    json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+    if not json_match:
+        raise ValueError(f"AI ไม่ได้ตอบกลับมาเป็น JSON: {result_text[:200]}")
 
-    with st.form(f"manual_entry_form_{fixed_type}", clear_on_submit=True):
-        c1, c2 = st.columns(2)
-        with c1:
-            trans_date = st.date_input("วันที่", value=date.today(), key=f"date_{fixed_type}")
-            amount = st.number_input("จำนวนเงิน (บาท)", min_value=0.0, step=10.0, format="%.2f", key=f"amount_{fixed_type}")
-        with c2:
-            category_choice = st.selectbox("หมวดหมู่", ["🤖 ให้ AI เลือกให้อัตโนมัติ"] + category_list, key=f"cat_{fixed_type}")
-            description = st.text_area("รายละเอียด", placeholder="เช่น ค่าข้าวเที่ยงกับเพื่อน", key=f"desc_{fixed_type}")
-
-        submitted = st.form_submit_button(f"💾 บันทึก{fixed_type_label}", type="primary", use_container_width=True)
-
-    if submitted:
-        if amount <= 0:
-            st.warning("กรุณาระบุจำนวนเงินมากกว่า 0 ครับ")
-            return
-
-        if category_choice == "🤖 ให้ AI เลือกให้อัตโนมัติ":
-            with st.spinner("AI กำลังเลือกหมวดหมู่ให้..."):
-                try:
-                    ai_result = categorize_with_ai(
-                        description or f"{fixed_type_label} {amount} บาท",
-                        expense_categories, income_categories
-                    )
-                    final_category = ai_result.get('category', 'อื่นๆ')
-                    if ai_result.get('is_new_category'):
-                        st.info(f"🆕 AI สร้างหมวดหมู่ใหม่ให้: **{final_category}**")
-                        add_category_if_new(final_category, fixed_type, current_user)
-                except Exception as e:
-                    st.warning(f"AI จัดหมวดหมู่ไม่สำเร็จ ใช้หมวด 'อื่นๆ' แทน: {e}")
-                    final_category = "อื่นๆ"
-        else:
-            final_category = category_choice
-
-        save_transaction(trans_date, fixed_type, amount, final_category, description, "manual", current_user)
-        st.cache_data.clear()
-        st.success(f"✅ บันทึกสำเร็จ! {fixed_type_label} {amount:,.2f} บาท ({final_category})")
-        st.rerun()
+    parsed = json.loads(json_match.group(0))
+    return parsed
 
 
 # =============================================================
-# ฟังก์ชันย่อย: พูดบันทึก (ใช้ร่วมกันทั้งแท็บรายรับ/รายจ่าย)
-# 🔧 ปรับปรุง: fixed_type มาจากแท็บที่เลือกไว้แล้วเสมอ (ไม่ให้ AI เดาประเภทจากคำพูดอีกต่อไป เพราะ
-# ผู้ใช้เลือกแท็บ "รายรับ"/"รายจ่าย" ไว้ล่วงหน้าแล้ว บ่งบอกเจตนาชัดเจนกว่าให้ AI เดาจากคำพูด)
+# ส่วนที่ 6: อ่านรูปภาพเอกสารการเงิน (เช่น สลิปเงินเดือน) ด้วย Claude แล้วแยกเป็นรายการย่อยๆ
+# 🆕 เหมือนกับที่ stock-scanner ใช้ AI อ่านรูปสลิป PVD — แต่ที่นี่แยกทั้งฝั่ง "รายรับ" (เงินเดือน,
+# ค่าเบี้ยเลี้ยง) และฝั่ง "รายการหัก/Deduction" (ประกันสังคม, PVD, ภาษี, สหกรณ์) ออกมาเป็นรายการ
+# ย่อยพร้อมกันในครั้งเดียว เพราะสลิปเงินเดือน 1 ใบ มักมีทั้ง 2 ฝั่งpanel อยู่ในรูปเดียวกัน
 # =============================================================
-def render_voice_entry(fixed_type, fixed_type_label):
-    st.caption(f"กดปุ่มแล้วพูดบรรยายรายการ{fixed_type_label} เช่น \"ค่าข้าวเที่ยง 80 บาท\"")
+IMAGE_EXTRACT_PROMPT_TEMPLATE = """คุณเป็นผู้ช่วยอ่านเอกสารทางการเงิน เช่น สลิปเงินเดือน ใบเสร็จ
+อ่านรูปภาพนี้ แล้วแยกทุกรายการย่อยที่เห็นออกมา (ห้ามเอายอดรวม/ยอดสุทธิ เอาแค่รายการย่อยแต่ละบรรทัด)
 
-    from streamlit_mic_recorder import mic_recorder
-    audio = mic_recorder(start_prompt="🎤 เริ่มพูด", stop_prompt="⏹️ หยุดพูด", format="wav", key=f"voice_recorder_{fixed_type}")
+รายการฝั่ง "รายรับ" (Income) เช่น เงินเดือน (Salary), ค่าเบี้ยเลี้ยงที่พัก (Housing Allowance),
+ค่าโทรศัพท์ (Mobile Allowance) → type = "income"
 
-    if not audio:
-        return
+รายการฝั่ง "รายการหัก/Deduction" เช่น ประกันสังคม (Social Welfare Fund), กองทุนสำรองเลี้ยงชีพ
+(Provident Fund/PVD), ภาษีหัก ณ ที่จ่าย (Withholding tax), สหกรณ์ (Cooperatives)
+→ type = "expense" (เพราะเป็นเงินที่ถูกหักออกไป เหมือนรายจ่ายอย่างหนึ่ง)
 
-    with st.spinner("กำลังแปลงเสียงเป็นข้อความ..."):
-        try:
-            transcribed_text = transcribe_audio(audio['bytes'])
-        except Exception as e:
-            st.error(f"❌ แปลงเสียงไม่สำเร็จ: {e}")
-            return
+หมวดหมู่รายจ่ายที่มีอยู่แล้ว: {expense_categories}
+หมวดหมู่รายรับที่มีอยู่แล้ว: {income_categories}
 
-    st.info(f"🗣️ ข้อความที่แปลงได้: \"{transcribed_text}\"")
+กรุณาตอบกลับเป็น JSON เท่านั้น ห้ามมีข้อความอื่นนอกเหนือจาก JSON เลยแม้แต่คำเดียว ห้ามใส่ ```json ครอบ
+ตอบเริ่มต้นด้วยเครื่องหมาย [ ทันที ตามโครงสร้างนี้เป๊ะๆ (เป็น list เพราะมีหลายรายการ):
 
-    with st.spinner("AI กำลังวิเคราะห์และจัดหมวดหมู่..."):
-        try:
-            ai_result = categorize_with_ai(transcribed_text, expense_categories, income_categories)
-        except Exception as e:
-            st.error(f"❌ AI วิเคราะห์ไม่สำเร็จ: {e}")
-            return
+[
+  {{
+    "description": "<ชื่อรายการตามที่เห็นในรูป แปลเป็นภาษาไทยถ้าเป็นภาษาอังกฤษ>",
+    "amount": <ตัวเลขจำนวนเงิน ไม่มีหน่วย ไม่มีคอมมา>,
+    "type": "income หรือ expense",
+    "category": "<ชื่อหมวดหมู่ — เลือกจากรายการที่มีอยู่แล้วถ้าตรงกัน ถ้าไม่ตรงเลยให้ตั้งชื่อหมวดหมู่ใหม่ที่เหมาะสมสั้นๆ กระชับ>",
+    "is_new_category": <true หรือ false>
+  }}
+]
 
-    # แสดงผลที่ AI วิเคราะห์ได้ ให้ผู้ใช้ตรวจสอบ/แก้ไขก่อนบันทึกจริงเสมอ
-    st.markdown("##### ✅ ตรวจสอบก่อนบันทึก")
-    with st.form(f"voice_confirm_form_{fixed_type}"):
-        vc1, vc2 = st.columns(2)
-        with vc1:
-            confirm_date = st.date_input("วันที่", value=date.today(), key=f"vc_date_{fixed_type}")
-            confirm_amount = st.number_input(
-                "จำนวนเงิน (บาท)", min_value=0.0, step=10.0,
-                value=float(ai_result.get('amount', 0)), format="%.2f", key=f"vc_amount_{fixed_type}"
-            )
-        with vc2:
-            confirm_category_list = income_categories if fixed_type == 'income' else expense_categories
-            _suggested = ai_result.get('category', 'อื่นๆ')
-            _options = confirm_category_list + ([_suggested] if _suggested not in confirm_category_list else [])
-            confirm_category = st.selectbox(
-                "หมวดหมู่ (AI แนะนำไว้แล้ว แก้ไขได้)", _options,
-                index=_options.index(_suggested) if _suggested in _options else 0,
-                key=f"vc_cat_{fixed_type}"
-            )
-            confirm_description = st.text_area("รายละเอียด", value=ai_result.get('description', transcribed_text), key=f"vc_desc_{fixed_type}")
-
-        voice_submitted = st.form_submit_button("💾 ยืนยันบันทึก", type="primary", use_container_width=True)
-
-    if voice_submitted:
-        if confirm_amount <= 0:
-            st.warning("กรุณาระบุจำนวนเงินมากกว่า 0 ครับ")
-        else:
-            add_category_if_new(confirm_category, fixed_type, current_user)
-            save_transaction(confirm_date, fixed_type, confirm_amount, confirm_category, confirm_description, "voice", current_user)
-            st.cache_data.clear()
-            st.success(f"✅ บันทึกสำเร็จ! {fixed_type_label} {confirm_amount:,.2f} บาท ({confirm_category})")
-            st.rerun()
+ถ้าอ่านรูปไม่ออกเลย หรือไม่ใช่เอกสารการเงิน ให้ตอบเป็น [] (list ว่างเปล่า)"""
 
 
-# =============================================================
-# ฟังก์ชันย่อย: อ่านจากรูปภาพ (เฉพาะแท็บ "รายรับ" — เพราะเอกสารแบบสลิปเงินเดือนมีทั้ง 2 ฝั่งใน
-# รูปเดียว AI จะแยกออกมาให้ทั้งรายรับและรายจ่าย/รายการหักพร้อมกันในครั้งเดียว)
-# =============================================================
-def render_image_entry():
-    st.caption(
-        "อัปโหลดรูปภาพเอกสารการเงิน เช่น สลิปเงินเดือน — AI จะแยกทั้งรายรับ (เงินเดือน, ค่าเบี้ยเลี้ยง) "
-        "และรายการหัก (ประกันสังคม, PVD, ภาษี) ออกมาให้อัตโนมัติ บันทึกเป็นรายการแยกๆ ทั้งฝั่งรายรับและรายจ่าย"
+def extract_transactions_from_image(image_bytes, media_type, expense_categories, income_categories):
+    """
+    ส่งรูปภาพไปให้ Claude อ่าน แยกเป็นรายการย่อยๆ (ทั้งรายรับและรายจ่าย/รายการหัก) คืนค่าเป็น
+    list ของ dict — Claude รองรับรับรูปภาพโดยตรงอยู่แล้ว (ต่างจากเสียงที่ต้องผ่าน Groq ก่อน)
+    ไม่ต้องผ่านบริการ OCR แยกต่างหากเลย
+    """
+    import anthropic
+    import base64
+    client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+
+    base64_image = base64.standard_b64encode(image_bytes).decode("utf-8")
+
+    prompt = (
+        IMAGE_EXTRACT_PROMPT_TEMPLATE
+        .replace("{expense_categories}", ", ".join(expense_categories))
+        .replace("{income_categories}", ", ".join(income_categories))
     )
 
-    uploaded_image = st.file_uploader("อัปโหลดรูปภาพ", type=["png", "jpg", "jpeg"], key="income_image_uploader")
+    response = client.messages.create(
+        model="claude-sonnet-5",
+        # 🔧 แก้บั๊ก: เดิมตั้งไว้แค่ 1500 ไม่พอสำหรับสลิปที่มีหลายรายการ (แต่ละรายการมี description,
+        # amount, type, category, is_new_category ใน JSON — ยิ่งรายการเยอะยิ่งใช้ token มาก) ทำให้
+        # คำตอบถูกตัดกลางคันบ่อยๆ (สังเกตได้จาก error ที่ AI "ตอบ JSON list มาจริง" แต่ไม่มี ] ปิดท้าย
+        # เลย ยืนยันว่าชนขีดจำกัดจริง ไม่ใช่ AI ตอบผิดรูปแบบเอง) เพิ่มเป็น 3000 ให้มีที่เขียนพอ
+        max_tokens=3000,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": base64_image}},
+                {"type": "text", "text": prompt},
+            ],
+        }],
+    )
+    result_text = "".join(block.text for block in response.content if block.type == "text")
 
-    if uploaded_image and st.button("🔍 วิเคราะห์รูปภาพด้วย AI", type="primary"):
-        with st.spinner("AI กำลังอ่านรูปภาพ... (อาจใช้เวลา 10-20 วินาที)"):
-            try:
-                extracted_items = extract_transactions_from_image(
-                    uploaded_image.getvalue(), uploaded_image.type,
-                    expense_categories, income_categories
-                )
-                if not extracted_items:
-                    st.warning("AI อ่านรูปนี้ไม่ออก หรือไม่พบรายการทางการเงินเลยครับ")
-                else:
-                    st.session_state['extracted_items'] = extracted_items
-            except Exception as e:
-                st.error(f"❌ อ่านรูปภาพไม่สำเร็จ: {e}")
-
-    if st.session_state.get('extracted_items'):
-        st.markdown("##### ✅ ตรวจสอบรายการที่ AI อ่านได้ก่อนบันทึก (แก้ไขในตารางได้เลย)")
-        shared_date = st.date_input("วันที่ของเอกสารนี้ (ใช้กับทุกรายการที่อ่านได้)", value=date.today(), key="image_shared_date")
-
-        edit_df = pd.DataFrame(st.session_state['extracted_items'])[['description', 'amount', 'type', 'category']]
-        edited_df = st.data_editor(
-            edit_df, use_container_width=True, hide_index=True, key="image_edit_table",
-            column_config={
-                "description": st.column_config.TextColumn("รายละเอียด"),
-                "amount": st.column_config.NumberColumn("จำนวนเงิน", format="%.2f", min_value=0.0),
-                "type": st.column_config.SelectboxColumn("ประเภท", options=["income", "expense"]),
-                "category": st.column_config.TextColumn("หมวดหมู่"),
-            },
-            num_rows="dynamic",  # ลบ/เพิ่มแถวเองได้ เผื่อ AI อ่านผิดหรือตกหล่นบางรายการ
+    # 🆕 เช็คว่าคำตอบถูกตัดกลางคันเพราะชน max_tokens อีกไหม (เผื่ออนาคตมีสลิปที่ยาวกว่านี้อีก)
+    # จะได้รู้สาเหตุทันทีแทนที่จะเดา
+    if response.stop_reason == "max_tokens":
+        raise ValueError(
+            "AI อ่านรูปภาพได้บางส่วนแต่คำตอบยาวเกินขีดจำกัดที่ตั้งไว้ (max_tokens) "
+            "ลองอัปโหลดรูปที่มีรายการน้อยลง หรือแจ้งผู้พัฒนาให้เพิ่ม max_tokens อีกครั้ง"
         )
 
-        total_income = edited_df[edited_df['type'] == 'income']['amount'].sum()
-        total_expense = edited_df[edited_df['type'] == 'expense']['amount'].sum()
-        st.caption(f"รวมรายรับ: {total_income:,.2f} ฿ | รวมรายการหัก/รายจ่าย: {total_expense:,.2f} ฿")
+    # แกะ JSON list ออกจากคำตอบด้วย Regex (ทนทานกว่าการเช็คแค่ว่าขึ้นต้นด้วย ```json)
+    json_match = re.search(r'\[.*\]', result_text, re.DOTALL)
+    if not json_match:
+        raise ValueError(f"AI ไม่ได้ตอบกลับมาเป็น JSON list: {result_text[:200]}")
 
-        bc1, bc2 = st.columns(2)
-        with bc1:
-            if st.button("💾 บันทึกทุกรายการ", type="primary", use_container_width=True):
-                _count = 0
-                for _, row in edited_df.iterrows():
-                    if row['amount'] > 0 and row['description']:
-                        add_category_if_new(row['category'], row['type'], current_user)
-                        save_transaction(shared_date, row['type'], row['amount'], row['category'], row['description'], "image", current_user)
-                        _count += 1
-                st.cache_data.clear()
-                st.success(f"✅ บันทึกสำเร็จ {_count} รายการ!")
-                st.session_state.pop('extracted_items', None)
-                st.rerun()
-        with bc2:
-            if st.button("❌ ยกเลิก ไม่บันทึก", use_container_width=True):
-                st.session_state.pop('extracted_items', None)
-                st.rerun()
-
-
-# =============================================================
-# เมนู 1: บันทึกรายการ — แยกเป็น 2 แท็บย่อยแนวนอน (รายรับ/รายจ่าย)
-# =============================================================
-if selected_menu == "บันทึกรายการ":
-    st.title("📝 บันทึกรายการ")
-
-    # 🆕 เพิ่มหมวดหมู่เองได้โดยตรง — ไม่ต้องพึ่ง AI สร้างให้อัตโนมัติเท่านั้น เผื่ออยากเพิ่มหมวดหมู่
-    # ที่รู้อยู่แล้วว่าจะใช้บ่อยไว้ล่วงหน้าเลย (เช่น หมวดหมู่ที่เพิ่งเปลี่ยนแปลงมาจากค่าเริ่มต้น แต่
-    # บัญชีนี้เคยสร้างหมวดหมู่ไปแล้วก่อนหน้า ค่าเริ่มต้นใหม่จะไม่ถูกเพิ่มให้อัตโนมัติอีก)
-    with st.expander("➕ เพิ่มหมวดหมู่เอง"):
-        with st.form("add_category_form", clear_on_submit=True):
-            ac1, ac2 = st.columns([1, 2])
-            with ac1:
-                new_cat_type = st.radio("ประเภท", ["รายรับ", "รายจ่าย"], horizontal=True, key="new_cat_type")
-            with ac2:
-                new_cat_name = st.text_input("ชื่อหมวดหมู่ใหม่", placeholder="เช่น ปันผลหุ้น", key="new_cat_name")
-            add_cat_submitted = st.form_submit_button("➕ เพิ่มหมวดหมู่นี้", type="primary")
-
-        if add_cat_submitted:
-            if not new_cat_name.strip():
-                st.warning("กรุณาพิมพ์ชื่อหมวดหมู่ก่อนครับ")
-            else:
-                _type_code = "income" if new_cat_type == "รายรับ" else "expense"
-                add_category_if_new(new_cat_name.strip(), _type_code, current_user)
-                st.success(f"✅ เพิ่มหมวดหมู่ '{new_cat_name.strip()}' ({new_cat_type}) สำเร็จแล้ว")
-                st.cache_data.clear()
-                st.rerun()
-
-    # 🔧 ปรับปรุง: สลับให้แท็บ "รายจ่าย" เป็นแท็บซ้ายสุด (Streamlit เปิดแท็บซ้ายสุดเป็นค่าเริ่มต้น
-    # เสมอ) เพราะใช้บันทึกรายจ่ายบ่อยกว่ารายรับมากในชีวิตประจำวัน — สลับแค่ตำแหน่งการแสดงผล ตัวแปร
-    # tab_expense/tab_income ยังอ้างอิงความหมายเดิมทุกจุด ไม่กระทบโค้ดด้านล่างเลย
-    tab_expense, tab_income = st.tabs(["🔴 รายจ่าย", "🟢 รายรับ"])
-
-    with tab_income:
-        income_method = st.radio(
-            "เลือกวิธีบันทึก", ["✍️ พิมพ์เอง", "🎤 พูดบันทึก", "📷 อ่านจากรูปภาพ"],
-            horizontal=True, key="income_method"
-        )
-        st.divider()
-        if income_method == "✍️ พิมพ์เอง":
-            render_manual_entry("income", "รายรับ")
-        elif income_method == "🎤 พูดบันทึก":
-            render_voice_entry("income", "รายรับ")
-        else:
-            render_image_entry()
-
-    with tab_expense:
-        expense_method = st.radio(
-            "เลือกวิธีบันทึก", ["✍️ พิมพ์เอง", "🎤 พูดบันทึก"],
-            horizontal=True, key="expense_method"
-        )
-        st.divider()
-        if expense_method == "✍️ พิมพ์เอง":
-            render_manual_entry("expense", "รายจ่าย")
-        else:
-            render_voice_entry("expense", "รายจ่าย")
-
-
-# =============================================================
-# เมนู 2: ประวัติรายการ
-# =============================================================
-elif selected_menu == "ประวัติรายการ":
-    st.title("📜 ประวัติรายการ")
-    transactions = load_transactions(current_user)
-
-    if not transactions:
-        st.info("ยังไม่มีรายการบันทึกไว้เลยครับ")
-    else:
-        df = pd.DataFrame(transactions)
-        df['date_parsed'] = pd.to_datetime(df['date'])
-
-        # 🆕 ตัวกรองเดือน — เลือกดูเฉพาะเดือนที่ต้องการ
-        THAI_MONTHS = {
-            1: "มกราคม", 2: "กุมภาพันธ์", 3: "มีนาคม", 4: "เมษายน", 5: "พฤษภาคม", 6: "มิถุนายน",
-            7: "กรกฎาคม", 8: "สิงหาคม", 9: "กันยายน", 10: "ตุลาคม", 11: "พฤศจิกายน", 12: "ธันวาคม"
-        }
-        df['month_key'] = df['date_parsed'].dt.strftime('%Y-%m')
-        df['month_label'] = df.apply(lambda r: f"{THAI_MONTHS[r['date_parsed'].month]} {r['date_parsed'].year}", axis=1)
-
-        month_lookup = df[['month_key', 'month_label']].drop_duplicates().sort_values('month_key', ascending=False)
-        month_choice = st.selectbox(
-            "📅 เลือกเดือนที่ต้องการดู", ["ทั้งหมด"] + month_lookup['month_label'].tolist(),
-            key="history_month_filter"
-        )
-
-        if month_choice != "ทั้งหมด":
-            _selected_month_key = month_lookup[month_lookup['month_label'] == month_choice]['month_key'].iloc[0]
-            _mask = df['month_key'] == _selected_month_key
-        else:
-            _mask = pd.Series([True] * len(df), index=df.index)
-
-        # 🔧 สำคัญ: เก็บ index ดั้งเดิมของ transactions list ไว้คู่กับ df ที่กรองแล้ว เพื่อให้
-        # "แถวที่ถูกเลือกในตาราง" ยังชี้กลับไปหารายการที่ถูกต้องใน transactions ได้เสมอ แม้จะกรอง
-        # เหลือแค่บางเดือนแล้วก็ตาม
-        filtered_df = df[_mask].reset_index(drop=True)
-        filtered_transactions = [transactions[i] for i in df[_mask].index.tolist()]
-
-        if filtered_df.empty:
-            st.info("ไม่มีรายการในเดือนที่เลือกเลยครับ")
-        else:
-            filtered_df['type_label'] = filtered_df['type'].map({'income': '🟢 รายรับ', 'expense': '🔴 รายจ่าย'})
-            filtered_df['source_label'] = filtered_df['source'].map({'manual': '✍️ พิมพ์', 'voice': '🎤 พูด', 'image': '📷 รูปภาพ'})
-
-            display_df = filtered_df[['date', 'type_label', 'amount', 'category', 'description', 'source_label']].rename(columns={
-                'date': 'วันที่', 'type_label': 'ประเภท', 'amount': 'จำนวนเงิน',
-                'category': 'หมวดหมู่', 'description': 'รายละเอียด', 'source_label': 'ที่มา'
-            })
-
-            st.caption("💡 คลิกที่แถวในตารางเพื่อเลือกรายการที่ต้องการแก้ไขหรือลบ (คลิกหัวคอลัมน์เพื่อเรียงลำดับได้ด้วย)")
-            # 🔧 ใช้ key แบบ dynamic ตาม month_choice — พอเปลี่ยนตัวกรองเดือน widget selection จะ
-            # รีเซ็ตใหม่หมดทุกครั้งโดยอัตโนมัติ (Streamlit ถือว่า key ต่างกัน = widget คนละตัว) กัน
-            # ปัญหา selection ค้าง index เกินขอบเขตข้ามการเปลี่ยนตัวกรอง (บั๊กเดียวกับที่เคยแก้ไปแล้ว
-            # ตอนลบรายการ แต่คราวนี้ป้องกันกรณี "เปลี่ยนตัวกรอง" เพิ่มเข้ามาด้วย)
-            table_key = f"history_table_{month_choice}"
-            event = st.dataframe(
-                display_df, use_container_width=True, hide_index=True,
-                on_select="rerun", selection_mode="single-row", key=table_key
-            )
-
-            selected_rows = event.selection.rows if event and event.selection else []
-
-            if selected_rows and selected_rows[0] < len(filtered_transactions):
-                selected_idx = selected_rows[0]
-                selected_transaction = filtered_transactions[selected_idx]
-
-                st.divider()
-                st.markdown("##### ✏️ แก้ไข/ลบรายการที่เลือก")
-
-                with st.form("edit_transaction_form"):
-                    ec1, ec2 = st.columns(2)
-                    with ec1:
-                        edit_type = st.radio(
-                            "ประเภท", ["รายจ่าย", "รายรับ"], horizontal=True,
-                            index=0 if selected_transaction['type'] == 'expense' else 1,
-                            key="edit_type"
-                        )
-                        edit_date = st.date_input(
-                            "วันที่", value=pd.to_datetime(selected_transaction['date']).date(), key="edit_date"
-                        )
-                        edit_amount = st.number_input(
-                            "จำนวนเงิน (บาท)", min_value=0.0, step=10.0,
-                            value=float(selected_transaction['amount']), format="%.2f", key="edit_amount"
-                        )
-                    with ec2:
-                        edit_category_list = expense_categories if edit_type == "รายจ่าย" else income_categories
-                        _current_cat = selected_transaction['category']
-                        _edit_options = edit_category_list + ([_current_cat] if _current_cat not in edit_category_list else [])
-                        edit_category = st.selectbox(
-                            "หมวดหมู่", _edit_options,
-                            index=_edit_options.index(_current_cat) if _current_cat in _edit_options else 0,
-                            key="edit_category"
-                        )
-                        edit_description = st.text_area(
-                            "รายละเอียด", value=selected_transaction['description'], key="edit_description"
-                        )
-
-                    edit_col1, edit_col2 = st.columns(2)
-                    with edit_col1:
-                        save_edit = st.form_submit_button("💾 บันทึกการแก้ไข", type="primary", use_container_width=True)
-                    with edit_col2:
-                        delete_edit = st.form_submit_button("🗑️ ลบรายการนี้", use_container_width=True)
-
-                if save_edit:
-                    if edit_amount <= 0:
-                        st.warning("กรุณาระบุจำนวนเงินมากกว่า 0 ครับ")
-                    else:
-                        edit_type_code = "expense" if edit_type == "รายจ่าย" else "income"
-                        add_category_if_new(edit_category, edit_type_code, current_user)
-                        update_transaction(
-                            selected_transaction['id'], edit_date, edit_type_code,
-                            edit_amount, edit_category, edit_description
-                        )
-                        st.session_state.pop(table_key, None)
-                        st.success("✅ แก้ไขสำเร็จ!")
-                        st.rerun()
-
-                if delete_edit:
-                    delete_transaction(selected_transaction['id'])
-                    st.session_state.pop(table_key, None)
-                    st.success("ลบสำเร็จ")
-                    st.rerun()
-
-        # =============================================================
-        # 🆕 ปุ่มล้างข้อมูล (Danger Zone) — ปิดไว้เป็นค่าเริ่มต้น ไม่ให้เด่นเกินไปจนกดพลาดง่าย
-        # ต้องยืนยันหลายชั้นก่อนลบจริงเสมอ (ติ๊กยืนยัน + สำหรับ "ล้างทั้งหมด" ต้องพิมพ์ชื่อผู้ใช้
-        # ตัวเองด้วย) เพราะเป็นการลบข้อมูลถาวร ย้อนคืนไม่ได้เลย
-        # =============================================================
-        st.divider()
-        with st.expander("🗑️ ล้างข้อมูล (ลบแล้วกู้คืนไม่ได้)"):
-            danger_tab1, danger_tab2 = st.tabs(["ล้างเฉพาะเดือน", "ล้างข้อมูลทั้งหมด"])
-
-            with danger_tab1:
-                if month_choice == "ทั้งหมด":
-                    st.caption("💡 เลือกเดือนที่ต้องการลบจาก Dropdown ด้านบนก่อนครับ (ไม่ใช่ \"ทั้งหมด\")")
-                else:
-                    st.warning(
-                        f"กำลังจะลบรายการทั้งหมดของเดือน **{month_choice}** "
-                        f"({len(filtered_transactions)} รายการ) — ไม่สามารถย้อนคืนได้"
-                    )
-                    confirm_month_delete = st.checkbox(
-                        "ฉันเข้าใจว่าการลบนี้ไม่สามารถย้อนคืนได้", key="confirm_month_delete"
-                    )
-                    if st.button(
-                        "🗑️ ลบข้อมูลเดือนนี้ทั้งหมด",
-                        disabled=(not confirm_month_delete or len(filtered_transactions) == 0),
-                        key="btn_delete_month"
-                    ):
-                        _del_month_key = month_lookup[month_lookup['month_label'] == month_choice]['month_key'].iloc[0]
-                        _del_year, _del_month = map(int, _del_month_key.split('-'))
-                        _deleted_count = delete_transactions_by_month(current_user, _del_year, _del_month)
-                        st.success(f"✅ ลบข้อมูลเดือน {month_choice} ไปแล้ว {_deleted_count} รายการ")
-                        st.rerun()
-
-            with danger_tab2:
-                st.error(
-                    f"⚠️ กำลังจะลบ **ทุกรายการทั้งหมด** ของบัญชี {current_user} "
-                    f"({len(transactions)} รายการ) อย่างถาวร ไม่สามารถย้อนคืนได้"
-                )
-                confirm_all_check = st.checkbox(
-                    "ฉันเข้าใจว่าการลบนี้จะลบทุกรายการทั้งหมดอย่างถาวร", key="confirm_all_check"
-                )
-                confirm_all_text = st.text_input(
-                    f"พิมพ์ชื่อผู้ใช้ของคุณ ({current_user}) เพื่อยืนยัน", key="confirm_all_text"
-                )
-                if st.button(
-                    "🗑️🔥 ลบข้อมูลทั้งหมด", type="primary",
-                    disabled=(not confirm_all_check or confirm_all_text != current_user),
-                    key="btn_delete_all"
-                ):
-                    _deleted_count = delete_all_transactions(current_user)
-                    st.success(f"✅ ลบข้อมูลทั้งหมดไปแล้ว {_deleted_count} รายการ")
-                    st.rerun()
-
-
-# =============================================================
-# เมนู 3: สรุปภาพรวม
-# =============================================================
-elif selected_menu == "สรุปภาพรวม":
-    st.title("📊 สรุปภาพรวม")
-    transactions = load_transactions(current_user)
-
-    if not transactions:
-        st.info("ยังไม่มีข้อมูลให้สรุปครับ")
-    else:
-        df = pd.DataFrame(transactions)
-        df['date_parsed'] = pd.to_datetime(df['date'])
-
-        # 🆕 ตัวกรองช่วงเวลา — 3 เดือน, 6 เดือน, 1 ปี, ทั้งหมด, หรือกำหนดเอง
-        st.markdown("##### 🗓️ เลือกช่วงเวลา")
-        range_choice = st.radio(
-            "ช่วงเวลา", ["3 เดือนล่าสุด", "6 เดือนล่าสุด", "1 ปีล่าสุด", "ทั้งหมด", "กำหนดเอง"],
-            horizontal=True, key="summary_range_choice", label_visibility="collapsed"
-        )
-
-        today_ts = pd.Timestamp(date.today())
-        if range_choice == "3 เดือนล่าสุด":
-            filtered_df = df[df['date_parsed'] >= today_ts - pd.DateOffset(months=3)]
-        elif range_choice == "6 เดือนล่าสุด":
-            filtered_df = df[df['date_parsed'] >= today_ts - pd.DateOffset(months=6)]
-        elif range_choice == "1 ปีล่าสุด":
-            filtered_df = df[df['date_parsed'] >= today_ts - pd.DateOffset(years=1)]
-        elif range_choice == "ทั้งหมด":
-            filtered_df = df
-        else:  # กำหนดเอง
-            dc1, dc2 = st.columns(2)
-            with dc1:
-                custom_start = st.date_input(
-                    "จากวันที่", value=df['date_parsed'].min().date(), key="summary_custom_start"
-                )
-            with dc2:
-                custom_end = st.date_input("ถึงวันที่", value=date.today(), key="summary_custom_end")
-            filtered_df = df[
-                (df['date_parsed'] >= pd.Timestamp(custom_start)) &
-                (df['date_parsed'] <= pd.Timestamp(custom_end))
-            ]
-
-        st.divider()
-
-        if filtered_df.empty:
-            st.info("ไม่มีรายการในช่วงเวลาที่เลือกเลยครับ")
-        else:
-            total_income = filtered_df[filtered_df['type'] == 'income']['amount'].sum()
-            total_expense = filtered_df[filtered_df['type'] == 'expense']['amount'].sum()
-            net = total_income - total_expense
-
-            # 🆕 เปลี่ยนจาก st.metric() ธรรมดา มาเป็นการ์ดสไตล์เดียวกับ stock-scanner
-            c1, c2, c3 = st.columns(3)
-            render_metric_card(c1, "รายรับรวม", f"{total_income:,.0f} ฿", icon="🟢")
-            render_metric_card(c2, "รายจ่ายรวม", f"{total_expense:,.0f} ฿", icon="🔴")
-            render_metric_card(
-                c3, "คงเหลือสุทธิ", f"{net:,.0f} ฿", icon="💰",
-                delta="เกินดุล" if net >= 0 else "ขาดดุล", delta_positive=(net >= 0)
-            )
-
-            st.divider()
-            st.markdown("##### 📊 รายจ่ายแยกตามหมวดหมู่")
-
-            expense_by_cat = filtered_df[filtered_df['type'] == 'expense'].groupby('category')['amount'].sum().sort_values(ascending=False)
-
-            if expense_by_cat.empty:
-                st.caption("ยังไม่มีรายการรายจ่ายในช่วงเวลานี้เลย")
-            else:
-                # 🆕 แบ่งครึ่งหน้าจอ — กราฟแท่งด้านซ้าย + กราฟ Donut ด้านขวา (ใช้ข้อมูลเดียวกัน
-                # คนละมุมมอง: แท่งช่วยเทียบขนาดตรงๆ ส่วน Donut เห็นสัดส่วนโดยรวมชัดกว่า)
-                theme_colors = get_theme_colors()
-                chart_col1, chart_col2 = st.columns(2)
-
-                with chart_col1:
-                    fig_bar = go.Figure(go.Bar(
-                        x=expense_by_cat.values, y=expense_by_cat.index, orientation='h',
-                        marker_color=theme_colors['chart_colors'][:len(expense_by_cat)]
-                    ))
-                    fig_bar.update_layout(
-                        title="แยกตามหมวดหมู่ (แท่ง)", height=420,
-                        margin=dict(l=10, r=10, t=40, b=10), yaxis=dict(autorange="reversed")
-                    )
-                    st.plotly_chart(style_plotly(fig_bar), use_container_width=True)
-
-                with chart_col2:
-                    fig_donut = go.Figure(go.Pie(
-                        labels=expense_by_cat.index, values=expense_by_cat.values, hole=0.45,
-                        marker=dict(colors=theme_colors['chart_colors'])
-                    ))
-                    fig_donut.update_layout(
-                        title="สัดส่วนรายจ่าย", height=420, margin=dict(l=10, r=10, t=40, b=10)
-                    )
-                    st.plotly_chart(style_plotly(fig_donut), use_container_width=True)
+    return json.loads(json_match.group(0))
