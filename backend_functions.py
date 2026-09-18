@@ -38,38 +38,45 @@ def get_firestore_client():
 
 # =============================================================
 # ส่วนที่ 2: จัดการหมวดหมู่ (Categories)
+# 🆕 แยกข้อมูลตามผู้ใช้ (user_id) — แต่ละคนมีชุดหมวดหมู่เป็นของตัวเอง ไม่ปนกัน เหมือนที่แยก
+# Google Sheet คนละไฟล์กันใน stock-scanner
 # =============================================================
-def load_categories(category_type):
+def load_categories(category_type, user_id):
     """
-    โหลดรายชื่อหมวดหมู่ทั้งหมดจาก Firestore (แยกตามประเภท 'income' หรือ 'expense')
+    โหลดรายชื่อหมวดหมู่ทั้งหมดของผู้ใช้คนนี้จาก Firestore (แยกตามประเภท 'income' หรือ 'expense')
     ถ้ายังไม่เคยมีเลย จะสร้างหมวดหมู่เริ่มต้นให้อัตโนมัติในครั้งแรก
     """
     db = get_firestore_client()
-    categories_ref = db.collection('categories').where('type', '==', category_type)
+    categories_ref = (
+        db.collection('categories')
+        .where('user_id', '==', user_id)
+        .where('type', '==', category_type)
+    )
     docs = list(categories_ref.stream())
 
     if not docs:
         # ยังไม่เคยมีหมวดหมู่เลย สร้างชุดเริ่มต้นให้อัตโนมัติ
         default_list = DEFAULT_EXPENSE_CATEGORIES if category_type == 'expense' else DEFAULT_INCOME_CATEGORIES
         for name in default_list:
-            db.collection('categories').add({'name': name, 'type': category_type})
+            db.collection('categories').add({'name': name, 'type': category_type, 'user_id': user_id})
         return default_list
 
     return sorted([doc.to_dict()['name'] for doc in docs])
 
 
-def add_category_if_new(name, category_type):
-    """เพิ่มหมวดหมู่ใหม่ลง Firestore ถ้ายังไม่มีอยู่แล้ว (กันหมวดหมู่ซ้ำ)"""
+def add_category_if_new(name, category_type, user_id):
+    """เพิ่มหมวดหมู่ใหม่ลง Firestore ถ้าผู้ใช้คนนี้ยังไม่มีหมวดหมู่นี้อยู่แล้ว (กันหมวดหมู่ซ้ำ)"""
     db = get_firestore_client()
-    existing = load_categories(category_type)
+    existing = load_categories(category_type, user_id)
     if name not in existing:
-        db.collection('categories').add({'name': name, 'type': category_type})
+        db.collection('categories').add({'name': name, 'type': category_type, 'user_id': user_id})
 
 
 # =============================================================
 # ส่วนที่ 3: บันทึก/โหลด/ลบ รายการรายรับ-รายจ่าย
+# 🆕 แยกข้อมูลตามผู้ใช้ (user_id) เช่นเดียวกัน — แต่ละคนเห็นแค่รายการของตัวเองเท่านั้น
 # =============================================================
-def save_transaction(trans_date, trans_type, amount, category, description, source):
+def save_transaction(trans_date, trans_type, amount, category, description, source, user_id):
     """
     บันทึกรายการลง Firestore
     trans_type: 'income' หรือ 'expense'
@@ -83,15 +90,26 @@ def save_transaction(trans_date, trans_type, amount, category, description, sour
         'category': category,
         'description': description,
         'source': source,
+        'user_id': user_id,
         'created_at': datetime.now().isoformat(),
     })
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def load_transactions():
-    """โหลดรายการทั้งหมด เรียงจากล่าสุดไปเก่าสุด (แคช 30 วินาที กันโหลดซ้ำถี่เกินไป)"""
+def load_transactions(user_id):
+    """
+    โหลดรายการทั้งหมดของผู้ใช้คนนี้ เรียงจากล่าสุดไปเก่าสุด (แคช 30 วินาที กันโหลดซ้ำถี่เกินไป)
+    ⚠️ หมายเหตุสำคัญ: การกรองด้วย where('user_id', ...) ควบคู่กับ order_by('created_at', ...)
+    ต้องมี Composite Index ใน Firestore ก่อนถึงจะใช้งานได้ — ถ้าเจอ error ตอนใช้งานจริง Firestore
+    จะแสดงลิงก์ให้กดสร้าง Index ได้เลยในข้อความ error นั้น (กดลิงก์ กด Create แล้วรอ 1-2 นาที)
+    """
     db = get_firestore_client()
-    docs = db.collection('transactions').order_by('created_at', direction=firestore.Query.DESCENDING).stream()
+    docs = (
+        db.collection('transactions')
+        .where('user_id', '==', user_id)
+        .order_by('created_at', direction=firestore.Query.DESCENDING)
+        .stream()
+    )
     results = []
     for doc in docs:
         d = doc.to_dict()
