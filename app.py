@@ -323,34 +323,43 @@ elif selected_menu == "ประวัติรายการ":
         df = pd.DataFrame(transactions)
         df['date_parsed'] = pd.to_datetime(df['date'])
 
-        # 🆕 ตัวกรองเดือน — เลือกดูเฉพาะเดือนที่ต้องการ
+        # 🔧 ปรับปรุง: เดิมรวม "เดือน+ปี" ไว้ใน Dropdown เดียว พอใช้งานไปหลายปี ตัวเลือกจะยาวมาก
+        # (เช่น ใช้ 3 ปี = 36 ตัวเลือก) ตอนนี้แยกเป็น 2 Dropdown อิสระ — "ปี" (มีแค่เท่าที่มีข้อมูล
+        # จริง) กับ "เดือน" (คงที่แค่ 12 ตัวเลือกเสมอ ไม่ว่าจะใช้งานมากี่ปีก็ตาม)
         THAI_MONTHS = {
             1: "มกราคม", 2: "กุมภาพันธ์", 3: "มีนาคม", 4: "เมษายน", 5: "พฤษภาคม", 6: "มิถุนายน",
             7: "กรกฎาคม", 8: "สิงหาคม", 9: "กันยายน", 10: "ตุลาคม", 11: "พฤศจิกายน", 12: "ธันวาคม"
         }
-        df['month_key'] = df['date_parsed'].dt.strftime('%Y-%m')
-        df['month_label'] = df.apply(lambda r: f"{THAI_MONTHS[r['date_parsed'].month]} {r['date_parsed'].year}", axis=1)
+        THAI_MONTHS_REVERSE = {v: k for k, v in THAI_MONTHS.items()}
 
-        month_lookup = df[['month_key', 'month_label']].drop_duplicates().sort_values('month_key', ascending=False)
-        month_choice = st.selectbox(
-            "📅 เลือกเดือนที่ต้องการดู", ["ทั้งหมด"] + month_lookup['month_label'].tolist(),
-            key="history_month_filter"
-        )
+        df['year'] = df['date_parsed'].dt.year
+        df['month_num'] = df['date_parsed'].dt.month
+        available_years = sorted(df['year'].unique().tolist(), reverse=True)
 
+        fc1, fc2 = st.columns(2)
+        with fc1:
+            year_choice = st.selectbox(
+                "📅 ปี", ["ทั้งหมด"] + [str(y) for y in available_years], key="history_year_filter"
+            )
+        with fc2:
+            month_choice = st.selectbox(
+                "🗓️ เดือน", ["ทั้งหมด"] + [THAI_MONTHS[m] for m in range(1, 13)], key="history_month_filter"
+            )
+
+        _mask = pd.Series([True] * len(df), index=df.index)
+        if year_choice != "ทั้งหมด":
+            _mask &= (df['year'] == int(year_choice))
         if month_choice != "ทั้งหมด":
-            _selected_month_key = month_lookup[month_lookup['month_label'] == month_choice]['month_key'].iloc[0]
-            _mask = df['month_key'] == _selected_month_key
-        else:
-            _mask = pd.Series([True] * len(df), index=df.index)
+            _mask &= (df['month_num'] == THAI_MONTHS_REVERSE[month_choice])
 
         # 🔧 สำคัญ: เก็บ index ดั้งเดิมของ transactions list ไว้คู่กับ df ที่กรองแล้ว เพื่อให้
         # "แถวที่ถูกเลือกในตาราง" ยังชี้กลับไปหารายการที่ถูกต้องใน transactions ได้เสมอ แม้จะกรอง
-        # เหลือแค่บางเดือนแล้วก็ตาม
+        # เหลือแค่บางเดือน/ปีแล้วก็ตาม
         filtered_df = df[_mask].reset_index(drop=True)
         filtered_transactions = [transactions[i] for i in df[_mask].index.tolist()]
 
         if filtered_df.empty:
-            st.info("ไม่มีรายการในเดือนที่เลือกเลยครับ")
+            st.info("ไม่มีรายการในช่วงที่เลือกเลยครับ")
         else:
             filtered_df['type_label'] = filtered_df['type'].map({'income': '🟢 รายรับ', 'expense': '🔴 รายจ่าย'})
             filtered_df['source_label'] = filtered_df['source'].map({'manual': '✍️ พิมพ์', 'voice': '🎤 พูด', 'image': '📷 รูปภาพ'})
@@ -361,11 +370,10 @@ elif selected_menu == "ประวัติรายการ":
             })
 
             st.caption("💡 คลิกที่แถวในตารางเพื่อเลือกรายการที่ต้องการแก้ไขหรือลบ (คลิกหัวคอลัมน์เพื่อเรียงลำดับได้ด้วย)")
-            # 🔧 ใช้ key แบบ dynamic ตาม month_choice — พอเปลี่ยนตัวกรองเดือน widget selection จะ
-            # รีเซ็ตใหม่หมดทุกครั้งโดยอัตโนมัติ (Streamlit ถือว่า key ต่างกัน = widget คนละตัว) กัน
-            # ปัญหา selection ค้าง index เกินขอบเขตข้ามการเปลี่ยนตัวกรอง (บั๊กเดียวกับที่เคยแก้ไปแล้ว
-            # ตอนลบรายการ แต่คราวนี้ป้องกันกรณี "เปลี่ยนตัวกรอง" เพิ่มเข้ามาด้วย)
-            table_key = f"history_table_{month_choice}"
+            # 🔧 ใช้ key แบบ dynamic ตามทั้งปีและเดือนที่เลือก — พอเปลี่ยนตัวกรองไหนก็ตาม widget
+            # selection จะรีเซ็ตใหม่หมดทุกครั้งโดยอัตโนมัติ (Streamlit ถือว่า key ต่างกัน = widget
+            # คนละตัว) กันปัญหา selection ค้าง index เกินขอบเขตข้ามการเปลี่ยนตัวกรอง
+            table_key = f"history_table_{year_choice}_{month_choice}"
             event = st.dataframe(
                 display_df, use_container_width=True, hide_index=True,
                 on_select="rerun", selection_mode="single-row", key=table_key
@@ -444,11 +452,14 @@ elif selected_menu == "ประวัติรายการ":
             danger_tab1, danger_tab2 = st.tabs(["ล้างเฉพาะเดือน", "ล้างข้อมูลทั้งหมด"])
 
             with danger_tab1:
-                if month_choice == "ทั้งหมด":
-                    st.caption("💡 เลือกเดือนที่ต้องการลบจาก Dropdown ด้านบนก่อนครับ (ไม่ใช่ \"ทั้งหมด\")")
+                if year_choice == "ทั้งหมด" or month_choice == "ทั้งหมด":
+                    st.caption(
+                        "💡 เลือกทั้ง \"ปี\" และ \"เดือน\" ที่ต้องการลบจาก Dropdown ด้านบนก่อนครับ "
+                        "(ต้องเจาะจงทั้งคู่ ไม่ใช่ \"ทั้งหมด\")"
+                    )
                 else:
                     st.warning(
-                        f"กำลังจะลบรายการทั้งหมดของเดือน **{month_choice}** "
+                        f"กำลังจะลบรายการทั้งหมดของเดือน **{month_choice} {year_choice}** "
                         f"({len(filtered_transactions)} รายการ) — ไม่สามารถย้อนคืนได้"
                     )
                     confirm_month_delete = st.checkbox(
@@ -459,10 +470,10 @@ elif selected_menu == "ประวัติรายการ":
                         disabled=(not confirm_month_delete or len(filtered_transactions) == 0),
                         key="btn_delete_month"
                     ):
-                        _del_month_key = month_lookup[month_lookup['month_label'] == month_choice]['month_key'].iloc[0]
-                        _del_year, _del_month = map(int, _del_month_key.split('-'))
-                        _deleted_count = delete_transactions_by_month(current_user, _del_year, _del_month)
-                        st.success(f"✅ ลบข้อมูลเดือน {month_choice} ไปแล้ว {_deleted_count} รายการ")
+                        _deleted_count = delete_transactions_by_month(
+                            current_user, int(year_choice), THAI_MONTHS_REVERSE[month_choice]
+                        )
+                        st.success(f"✅ ลบข้อมูลเดือน {month_choice} {year_choice} ไปแล้ว {_deleted_count} รายการ")
                         st.rerun()
 
             with danger_tab2:
