@@ -14,6 +14,7 @@ from theme import apply_theme, render_metric_card, get_theme_colors, style_plotl
 from backend_functions import (
     load_categories, add_category_if_new, save_transaction,
     load_transactions, delete_transaction, update_transaction,
+    delete_transactions_by_month, delete_all_transactions,
     transcribe_audio, categorize_with_ai, extract_transactions_from_image,
 )
 
@@ -103,7 +104,35 @@ def render_voice_entry(fixed_type, fixed_type_label):
     st.caption(f"กดปุ่มแล้วพูดบรรยายรายการ{fixed_type_label} เช่น \"ค่าข้าวเที่ยง 80 บาท\"")
 
     from streamlit_mic_recorder import mic_recorder
-    audio = mic_recorder(start_prompt="🎤 เริ่มพูด", stop_prompt="⏹️ หยุดพูด", format="wav", key=f"voice_recorder_{fixed_type}")
+
+    # 🆕 ทำให้ปุ่มพูดบันทึกเป็น Floating Action Button ลอยอยู่กึ่งกลางด้านล่างจอ — เฉพาะตอนหน้าจอ
+    # แคบ (มือถือ) เท่านั้น ผ่าน CSS media query (บนจอกว้าง/คอมพิวเตอร์ ยังคงแสดงแบบ inline ปกติ
+    # เพราะลอยกลางจอกว้างจะดูแปลกและอาจบังเนื้อหาอื่น) ใช้ st.container(key=...) ซึ่ง Streamlit
+    # จะสร้างคลาส CSS เฉพาะให้อัตโนมัติ (.st-key-{key}) ทำให้ style เจาะจงแค่ปุ่มนี้ตัวเดียวได้แม่นยำ
+    # ไม่กระทบส่วนอื่นของหน้า — เว้นระยะจากขอบล่างด้วย env(safe-area-inset-bottom) เผื่อมือถือรุ่น
+    # ใหม่ที่มี gesture bar ด้านล่างจอด้วย
+    _fab_key = f"mic_fab_{fixed_type}"
+    st.markdown(f"""
+        <style>
+        @media (max-width: 768px) {{
+            div.st-key-{_fab_key} {{
+                position: fixed;
+                bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+                left: 50%;
+                transform: translateX(-50%);
+                z-index: 9999;
+                background-color: white;
+                border-radius: 50px;
+                box-shadow: 0 4px 14px rgba(0,0,0,0.2);
+                padding: 8px 14px;
+                width: auto !important;
+            }}
+        }}
+        </style>
+    """, unsafe_allow_html=True)
+
+    with st.container(key=_fab_key):
+        audio = mic_recorder(start_prompt="🎤 เริ่มพูด", stop_prompt="⏹️ หยุดพูด", format="wav", key=f"voice_recorder_{fixed_type}")
 
     if not audio:
         return
@@ -258,7 +287,7 @@ if selected_menu == "บันทึกรายการ":
 
     with tab_income:
         income_method = st.radio(
-            "เลือกวิธีบันทึก", ["✍️ พิมพ์เอง", "🎤 พูดบันทึก", "📷 อ่านจากรูปภาพ"],
+            "เลือกวิธีบันทึก", ["🎤 พูดบันทึก", "✍️ พิมพ์เอง", "📷 อ่านจากรูปภาพ"],
             horizontal=True, key="income_method"
         )
         st.divider()
@@ -271,7 +300,7 @@ if selected_menu == "บันทึกรายการ":
 
     with tab_expense:
         expense_method = st.radio(
-            "เลือกวิธีบันทึก", ["✍️ พิมพ์เอง", "🎤 พูดบันทึก"],
+            "เลือกวิธีบันทึก", ["🎤 พูดบันทึก", "✍️ พิมพ์เอง"],
             horizontal=True, key="expense_method"
         )
         st.divider()
@@ -403,6 +432,57 @@ elif selected_menu == "ประวัติรายการ":
                     delete_transaction(selected_transaction['id'])
                     st.session_state.pop(table_key, None)
                     st.success("ลบสำเร็จ")
+                    st.rerun()
+
+        # =============================================================
+        # 🆕 ปุ่มล้างข้อมูล (Danger Zone) — ปิดไว้เป็นค่าเริ่มต้น ไม่ให้เด่นเกินไปจนกดพลาดง่าย
+        # ต้องยืนยันหลายชั้นก่อนลบจริงเสมอ (ติ๊กยืนยัน + สำหรับ "ล้างทั้งหมด" ต้องพิมพ์ชื่อผู้ใช้
+        # ตัวเองด้วย) เพราะเป็นการลบข้อมูลถาวร ย้อนคืนไม่ได้เลย
+        # =============================================================
+        st.divider()
+        with st.expander("🗑️ ล้างข้อมูล (ลบแล้วกู้คืนไม่ได้)"):
+            danger_tab1, danger_tab2 = st.tabs(["ล้างเฉพาะเดือน", "ล้างข้อมูลทั้งหมด"])
+
+            with danger_tab1:
+                if month_choice == "ทั้งหมด":
+                    st.caption("💡 เลือกเดือนที่ต้องการลบจาก Dropdown ด้านบนก่อนครับ (ไม่ใช่ \"ทั้งหมด\")")
+                else:
+                    st.warning(
+                        f"กำลังจะลบรายการทั้งหมดของเดือน **{month_choice}** "
+                        f"({len(filtered_transactions)} รายการ) — ไม่สามารถย้อนคืนได้"
+                    )
+                    confirm_month_delete = st.checkbox(
+                        "ฉันเข้าใจว่าการลบนี้ไม่สามารถย้อนคืนได้", key="confirm_month_delete"
+                    )
+                    if st.button(
+                        "🗑️ ลบข้อมูลเดือนนี้ทั้งหมด",
+                        disabled=(not confirm_month_delete or len(filtered_transactions) == 0),
+                        key="btn_delete_month"
+                    ):
+                        _del_month_key = month_lookup[month_lookup['month_label'] == month_choice]['month_key'].iloc[0]
+                        _del_year, _del_month = map(int, _del_month_key.split('-'))
+                        _deleted_count = delete_transactions_by_month(current_user, _del_year, _del_month)
+                        st.success(f"✅ ลบข้อมูลเดือน {month_choice} ไปแล้ว {_deleted_count} รายการ")
+                        st.rerun()
+
+            with danger_tab2:
+                st.error(
+                    f"⚠️ กำลังจะลบ **ทุกรายการทั้งหมด** ของบัญชี {current_user} "
+                    f"({len(transactions)} รายการ) อย่างถาวร ไม่สามารถย้อนคืนได้"
+                )
+                confirm_all_check = st.checkbox(
+                    "ฉันเข้าใจว่าการลบนี้จะลบทุกรายการทั้งหมดอย่างถาวร", key="confirm_all_check"
+                )
+                confirm_all_text = st.text_input(
+                    f"พิมพ์ชื่อผู้ใช้ของคุณ ({current_user}) เพื่อยืนยัน", key="confirm_all_text"
+                )
+                if st.button(
+                    "🗑️🔥 ลบข้อมูลทั้งหมด", type="primary",
+                    disabled=(not confirm_all_check or confirm_all_text != current_user),
+                    key="btn_delete_all"
+                ):
+                    _deleted_count = delete_all_transactions(current_user)
+                    st.success(f"✅ ลบข้อมูลทั้งหมดไปแล้ว {_deleted_count} รายการ")
                     st.rerun()
 
 
